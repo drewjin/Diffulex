@@ -1,13 +1,13 @@
 [project]
-name = "D2fEngine"
+name = "DiffuServe"
 version = "0.0.1"
 authors = [
     { name = "Drew Jin (Yijie Jin)", email = "drewjin0827@gmail.com"},
 ]
 maintainers = [
-    { name = "SJTU DENG Lab" }
+    { name = "DENG Lab @ SJTU" }
 ]
-description = "vLLM implementation of Diffusion LLMs (based on D2F decoding paradigm)"
+description = "Diffusion LLM serving engine supporting multiple variants of dLLM decoding strategies with high efficiency and low latency."
 readme = "README.md"
 requires-python = ">=3.12"
 license = { file = "LICENSE" }
