@@ -5,17 +5,17 @@ import tilelang.language as T
 from flash_attn import flash_attn_varlen_func
 from tilelang.autotuner import set_autotune_inputs
 
-from tilelang.engine.callback import register_cuda_postproc_callback
-
 from diffulex_kernel.python.auto_tuner import build_configs
 from diffulex_kernel.python.kv_cache_kernels import load_kvcache
 from diffulex.attention.metadata import AttnMetaDataBase, is_warming_up
 
+# from tilelang.engine.callback import register_cuda_postproc_callback
 # @register_cuda_postproc_callback
 # def tilelang_callback_cuda_postproc(code, _):
 #     code = "// tilelang_callback_cuda_postproc: generated CUDA code by TileLang\n" + code
 #     print(code)
 #     return code
+
 
 kernel_config = None
 
@@ -243,8 +243,6 @@ def dllm_flash_attn_decode_kernel(
             
             cur_q_seqlen = q_end_idx - q_start_idx
             cur_kv_seqlen = kv_end_idx - kv_start_idx
-            T.device_assert(cur_q_seqlen == DIFFUSION_BLOCK_SIZE, "cur_q_seqlen must be equal to DIFFUSION_BLOCK_SIZE")
-            T.device_assert(cur_kv_seqlen == DIFFUSION_BLOCK_SIZE, "cur_kv_seqlen must be equal to DIFFUSION_BLOCK_SIZE")
             
             cur_context_len = context_lens[seq_idx]
             
@@ -257,14 +255,17 @@ def dllm_flash_attn_decode_kernel(
             T.fill(log_sum, 0)
             T.fill(scores_max, -T.infinity(ACCUM_DTYPE))
             
-            # Q/KVCache Cross-Attention
+            # ==========================
+            # Stage 1: KV Cache Attention (Context)
+            # ==========================
             for page_block_idx_local in T.Pipelined(MAX_SEQ_NUM_BLOCKS, num_stages=NUM_STAGES):
                 page_block_idx_global = block_table[page_block_idx_local]
                 if page_block_idx_global >= 0:
                     T.copy(K_Cache[page_block_idx_global, :, kv_head_idx, :], K_Cache_shared)
+                    
                     for i, j in T.Parallel(BLOCK_M, PAGE_BLOCK_SIZE):
                         acc_score_kvcache[i, j] = T.if_then_else(
-                            (q_start_idx + i >= cur_q_seqlen or 
+                            (i >= cur_q_seqlen or 
                             page_block_idx_local * PAGE_BLOCK_SIZE + j >= cur_context_len), -1e9, 0
                         )
                     
@@ -289,54 +290,60 @@ def dllm_flash_attn_decode_kernel(
                         log_sum[i] = log_sum[i] * scores_scale[i] + scores_sum[i]
                         
                     T.copy(acc_score_kvcache, acc_score_kvcache_cast)
+                    
+                    # Scale previous output accumulator
                     for i, j in T.Parallel(BLOCK_M, HEAD_DIM):
                         acc_output[i, j] *= scores_scale[i]
                     
-                    # Compute attention output
+                    # Accumulate current V_cache contribution
                     T.copy(V_Cache[page_block_idx_global, :, kv_head_idx, :], V_Cache_shared)
                     T.gemm(acc_score_kvcache_cast, V_Cache_shared, acc_output, policy=T.GemmWarpPolicy.FullRow)
                 
-            # QKV Self-Attention 
-            loop_range = T.ceildiv(cur_kv_seqlen, BLOCK_N)
-            for kv_block_idx in T.Pipelined(loop_range, num_stages=NUM_STAGES):
-                T.copy(K[kv_start_idx + kv_block_idx * BLOCK_N : kv_start_idx + (kv_block_idx + 1) * BLOCK_N, kv_head_idx, :], K_shared)
-                for i, j in T.Parallel(BLOCK_M, BLOCK_N):
-                    acc_score_kv[i, j] = T.if_then_else(
-                        (i >= cur_q_seqlen or 
-                        kv_block_idx * BLOCK_N + j >= cur_kv_seqlen), -1e9, 0
-                    )
-                
-                T.gemm(Q_shared, K_shared, acc_score_kv, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
-                
-                T.copy(scores_max, scores_max_prev)
-                T.fill(scores_max, -T.infinity(ACCUM_DTYPE))
-                T.reduce_max(acc_score_kv, scores_max, dim=1, clear=False)
-                for i in T.Parallel(BLOCK_M):
-                    scores_max[i] = T.max(scores_max[i], scores_max_prev[i])
-                
-                for i in T.Parallel(BLOCK_M):
-                    scores_scale[i] = T.exp2(scores_max_prev[i] * SCALE - scores_max[i] * SCALE)
-                
-                for i, j in T.Parallel(BLOCK_M, BLOCK_N):
-                    acc_score_kv[i, j] = T.exp2(acc_score_kv[i, j] * SCALE - scores_max[i] * SCALE)
+                if page_block_idx_local == MAX_SEQ_NUM_BLOCKS - 1:
+                    # ==========================
+                    # Stage 2: Fresh KV Attention (Self-Attn)
+                    # ==========================
+                    T.copy(K[kv_start_idx : kv_start_idx + BLOCK_N, kv_head_idx, :], K_shared)
+
+                    for i, j in T.Parallel(BLOCK_M, BLOCK_N):
+                        acc_score_kv[i, j] = T.if_then_else(i >= cur_q_seqlen or j >= cur_kv_seqlen, -1e9, 0)
                     
-                T.reduce_sum(acc_score_kv, scores_sum, dim=1)
-                for i in T.Parallel(BLOCK_M):
-                    log_sum[i] = log_sum[i] * scores_scale[i] + scores_sum[i]
+                    T.gemm(Q_shared, K_shared, acc_score_kv, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
                     
-                T.copy(acc_score_kv, acc_score_kv_cast)
-                for i, j in T.Parallel(BLOCK_M, HEAD_DIM):
-                    acc_output[i, j] *= scores_scale[i]
-                
-                T.copy(V[kv_start_idx : kv_start_idx + BLOCK_N, kv_head_idx, :], V_shared)
-                T.gemm(acc_score_kv_cast, V_shared, acc_output, policy=T.GemmWarpPolicy.FullRow)
+                    T.copy(scores_max, scores_max_prev)
+                    T.fill(scores_max, -T.infinity(ACCUM_DTYPE))
+                    T.reduce_max(acc_score_kv, scores_max, dim=1, clear=False)
+                    for i in T.Parallel(BLOCK_M):
+                        scores_max[i] = T.max(scores_max[i], scores_max_prev[i])
+                    
+                    for i in T.Parallel(BLOCK_M):
+                        scores_scale[i] = T.exp2(scores_max_prev[i] * SCALE - scores_max[i] * SCALE)
+                    
+                    for i, j in T.Parallel(BLOCK_M, BLOCK_N):
+                        acc_score_kv[i, j] = T.exp2(acc_score_kv[i, j] * SCALE - scores_max[i] * SCALE)
+                        
+                    T.reduce_sum(acc_score_kv, scores_sum, dim=1)
+                    for i in T.Parallel(BLOCK_M):
+                        log_sum[i] = log_sum[i] * scores_scale[i] + scores_sum[i]
+                        
+                    T.copy(acc_score_kv, acc_score_kv_cast)
+                    
+                    # Scale previous output
+                    for i, j in T.Parallel(BLOCK_M, HEAD_DIM):
+                        acc_output[i, j] *= scores_scale[i]
+                    
+                    T.copy(V[kv_start_idx : kv_start_idx + BLOCK_N, kv_head_idx, :], V_shared)
+                    
+                    # Accumulate current V contribution
+                    T.gemm(acc_score_kv_cast, V_shared, acc_output, policy=T.GemmWarpPolicy.FullRow)
             
+            # Finalize
             for i, j in T.Parallel(BLOCK_M, HEAD_DIM):
                 acc_output[i, j] /= log_sum[i]
 
             T.copy(acc_output, O_shared)
             for i, d_idx in T.Parallel(BLOCK_M, HEAD_DIM):
-                if i + q_start_idx < cur_q_seqlen:
+                if i < cur_q_seqlen:
                     O[i + q_start_idx, head_idx, d_idx] = O_shared[i, d_idx] 
             
     return kernel

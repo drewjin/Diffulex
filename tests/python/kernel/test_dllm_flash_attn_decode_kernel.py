@@ -5,6 +5,7 @@ import torch
 import tilelang
 import tilelang.testing
 import torch.nn.functional as F
+from einops import rearrange
 
 from diffulex_kernel.python.dllm_flash_attn import dllm_flash_attn_decode_kernel
 
@@ -44,14 +45,8 @@ def naive_sdpa_with_kvcache(
         output: [Q_LEN, NUM_HEADS, HEAD_DIM]
     """
     num_seqs = len(cu_seqlens_q) - 1
-    num_heads = q.shape[1]
-    num_kv_heads = k.shape[1]
-    head_dim = q.shape[2]
     
     output = torch.zeros_like(q)
-    
-    kv_indices = torch.arange(num_heads, device=q.device) // num_groups
-
     for seq_idx in range(num_seqs):
         q_start = cu_seqlens_q[seq_idx].item()
         q_end = cu_seqlens_q[seq_idx + 1].item()
@@ -89,14 +84,10 @@ def naive_sdpa_with_kvcache(
         else:
             k_combined = k_seq
             v_combined = v_seq
-        
-        # Expand KV per head according to GQA groups and run SDPA once
-        k_per_head = k_combined[:, kv_indices, :]  # [total_kv_len, num_heads, head_dim]
-        v_per_head = v_combined[:, kv_indices, :]
 
-        q_sdpa = q_seq.transpose(0, 1).unsqueeze(0)  # [1, num_heads, seq_q_len, head_dim]
-        k_sdpa = k_per_head.transpose(0, 1).unsqueeze(0)  # [1, num_heads, total_kv_len, head_dim]
-        v_sdpa = v_per_head.transpose(0, 1).unsqueeze(0)
+        q_sdpa = rearrange(q_seq, 's h d -> 1 h s d') # [1, num_heads, seq_q_len, head_dim]
+        k_sdpa = rearrange(k_combined, 's h d -> 1 h s d') # [1, num_heads, total_kv_len, head_dim]
+        v_sdpa = rearrange(v_combined, 's h d -> 1 h s d') # [1, num_heads, total_kv_len, head_dim]
 
         attn_out = F.scaled_dot_product_attention(
             q_sdpa,
@@ -105,9 +96,10 @@ def naive_sdpa_with_kvcache(
             dropout_p=0.0,
             is_causal=False,
             scale=scale,
+            enable_gqa=True,
         )  # [1, num_heads, seq_q_len, head_dim]
 
-        output[q_start:q_end] = attn_out.squeeze(0).transpose(0, 1).to(output.dtype)
+        output[q_start:q_end] = rearrange(attn_out, '1 h s d -> s h d').to(output.dtype)
     
     return output
 
@@ -378,23 +370,6 @@ def test_decode_bf16_diffusion_block_64():
         is_block_attn=True,
         dtype="bfloat16",
     )
-
-
-# def test_decode_f16_single_seq():
-#     """Test with single sequence, float16."""
-#     run_dllm_flash_attn_decode(
-#         num_seqs=1,
-#         num_heads=32,
-#         num_kv_heads=8,
-#         head_dim=128,
-#         max_q_len=64,
-#         max_kv_len=64,
-#         context_len=128,
-#         page_block_size=32,
-#         diffusion_block_size=32,
-#         is_block_attn=False,
-#         dtype="float16",
-#     )
 
 
 def test_decode_bf16_varied_stages():
