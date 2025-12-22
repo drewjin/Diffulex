@@ -51,8 +51,6 @@ jobs:
           git config --local user.name "github-actions[bot]"
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           find . -mindepth 1 -maxdepth 1 ! -name ".github" ! -name "." ! -name ".git" -exec rm -rf {} +
-          # Copy all files including hidden ones (like .nojekyll)
-          # Using shopt to include dotfiles in glob expansion
           shopt -s dotglob
           cp -r ../docs/_build/html/* ./
           git add .
