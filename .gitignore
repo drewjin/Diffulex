@@ -37,3 +37,10 @@ autotuner.log
 Fast-dLLM
 Discrete-Diffusion-Forcing
 position_explanation.md
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
