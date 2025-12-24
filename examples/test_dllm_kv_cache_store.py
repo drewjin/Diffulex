@@ -3,7 +3,7 @@ import torch
 
 from einops import rearrange
 
-from diffulex.legacy.layers.attention.ops import store_kvcache_distinct_layout, store_kvcache_unified_layout
+from diffulex_legacy.layers.attention.ops import store_kvcache_distinct_layout, store_kvcache_unified_layout
 
 
 if __name__ == "__main__":

@@ -24,6 +24,7 @@ TestResults.xml
 *.pyc
 *.egg-info
 lora_weight*
+*.log
 log/
 dist/
 build/
@@ -31,3 +32,15 @@ cache/
 uv.lock
 ckpt/
 data/
+tilelang
+autotuner.log
+Fast-dLLM
+Discrete-Diffusion-Forcing
+position_explanation.md
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

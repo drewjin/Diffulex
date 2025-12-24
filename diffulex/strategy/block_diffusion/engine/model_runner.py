@@ -1,32 +1,32 @@
 from __future__ import annotations
 
 import time
-from typing import list
+
 from multiprocessing.synchronize import Event
 
 import torch
 
 from diffulex.config import Config
 from diffulex.engine.sequence import SequenceBase
-from diffulex.strategy.block_diffusion.engine.sequence import BlockDiffusionSequence
-from diffulex.attention.metadata import set_fetch_fn_for_attn_metadata
+from diffulex.strategy.block_diffusion.engine.sequence import BDSequence
+from diffulex.attention.metadata import set_fetch_fn_for_attn_metadata, set_warming_up, reset_warming_up
 from diffulex.engine.model_runner import AutoModelRunner, ModelRunnerBase
-from diffulex.strategy.block_diffusion.attention.metadata import fetch_block_diffusion_attn_metadata, set_block_diffusion_attn_metadata, reset_block_diffusion_attn_metadata
+from diffulex.strategy.block_diffusion.attention.metadata import fetch_bd_attn_metadata, set_bd_attn_metadata, reset_bd_attn_metadata
 
 
 @AutoModelRunner.register("block_diffusion", is_default=True)
-class BlockDiffusionModelRunner(ModelRunnerBase):
+class BDModelRunner(ModelRunnerBase):
     """Reference implementation of Block Diffusion decoding strategy."""
-
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
-        super().__init__(config, rank, event)
+        set_fetch_fn_for_attn_metadata(fetch_bd_attn_metadata)
         self.diffusion_block_size = config.diffusion_block_size
         self.mask_token_id = config.mask_token_id
-        self.decoding_strategy = config.decoding_strategy
-        set_fetch_fn_for_attn_metadata(fetch_block_diffusion_attn_metadata)
-
+        
+        super().__init__(config, rank, event)
+        
     def warmup_model(self):
         print("Warming up model...")
+        set_warming_up(True)
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         max_num_batched_tokens, max_model_len = (
@@ -35,123 +35,14 @@ class BlockDiffusionModelRunner(ModelRunnerBase):
         )
         num_seqs = min(max_num_batched_tokens // max_model_len, self.config.max_num_seqs)
         test_input_ids = [0] * max_model_len
-        seqs = [BlockDiffusionSequence(test_input_ids, config=self.config) for _ in range(num_seqs)]
+        seqs = [BDSequence(test_input_ids, config=self.config) for _ in range(num_seqs)]
         self.run(seqs, True)
         for seq in seqs:
             seq.post_process()
         torch.cuda.empty_cache()
+        reset_warming_up()
 
-    def allocate_kv_cache(self):
-        config = self.config
-        hf_config = config.hf_config
-        free, total = torch.cuda.mem_get_info()
-        used = total - free
-        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
-        current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        num_kv_heads = getattr(
-            hf_config,
-            "num_key_value_heads",
-            getattr(hf_config, "n_kv_heads", None),
-        ) // self.world_size
-
-        if hasattr(hf_config, "head_dim"):
-            head_dim = hf_config.head_dim
-        elif hasattr(hf_config, "hidden_size") and hasattr(hf_config, "num_attention_heads"):
-            head_dim = hf_config.hidden_size // hf_config.num_attention_heads
-        else:
-            raise AttributeError(f"Cannot determine head_dim from config: {type(hf_config)}")
-
-        dtype = (
-            hf_config.torch_dtype
-            if hasattr(hf_config, "torch_dtype") and hf_config.torch_dtype
-            else torch.bfloat16
-        )
-        block_bytes = (
-            2
-            * hf_config.num_hidden_layers
-            * self.block_size
-            * num_kv_heads
-            * head_dim
-            * dtype.itemsize
-        )
-        get_num_kvcache_blocks = (
-            lambda gpu_memory_utilization: int(total * gpu_memory_utilization - used - peak + current)
-            // block_bytes
-        )
-        try:
-            num_kvcache_blocks = get_num_kvcache_blocks(config.gpu_memory_utilization)
-            assert num_kvcache_blocks > 0
-        except Exception:
-            gpu_memory_utilization = config.gpu_memory_utilization
-            while num_kvcache_blocks <= 200:
-                print(
-                    "Warning: GPU memory utilization "
-                    f"{gpu_memory_utilization} is too low to allocate kv cache. "
-                    "Automatically adding 0.05."
-                )
-                gpu_memory_utilization += 0.05
-                num_kvcache_blocks = get_num_kvcache_blocks(gpu_memory_utilization)
-            print(
-                f"Set gpu_memory_utilization to {gpu_memory_utilization:.2f} "
-                "to allocate kv cache."
-            )
-            config.gpu_memory_utilization = gpu_memory_utilization
-
-        config.num_kvcache_blocks = num_kvcache_blocks
-        print(
-            "Allocated {num_blocks} blocks of size {block_size} for kv cache on rank {rank}.".format(
-                num_blocks=config.num_kvcache_blocks,
-                block_size=self.block_size,
-                rank=self.rank,
-            )
-        )
-
-        if config.kv_cache_layout == "distinct":
-            x = config.k_cache_hdim_split_factor_x
-            self.k_cache = torch.zeros(
-                hf_config.num_hidden_layers,
-                config.num_kvcache_blocks,
-                num_kv_heads,
-                head_dim // x,
-                self.block_size,
-                x,
-            )
-            self.v_cache = torch.zeros(
-                hf_config.num_hidden_layers,
-                config.num_kvcache_blocks,
-                num_kv_heads,
-                head_dim,
-                self.block_size,
-            )
-            layer_id = 0
-            for module in self.model.modules():
-                if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
-                    module.k_cache = self.k_cache[layer_id]
-                    module.v_cache = self.v_cache[layer_id]
-                    layer_id += 1
-        elif config.kv_cache_layout == "unified":
-            self.kv_cache = torch.zeros(
-                2,
-                hf_config.num_hidden_layers,
-                config.num_kvcache_blocks,
-                self.block_size,
-                num_kv_heads,
-                head_dim,
-            )
-            layer_id = 0
-            for module in self.model.modules():
-                if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
-                    module.k_cache = self.kv_cache[0, layer_id]
-                    module.v_cache = self.kv_cache[1, layer_id]
-                    layer_id += 1
-        else:
-            raise ValueError(
-                "Unsupported kv_cache_layout: {layout}. Supported values are 'distinct' and 'unified'.".format(
-                    layout=config.kv_cache_layout
-                )
-            )
-
-    def prepare_prefill(self, seqs: list[BlockDiffusionSequence]):
+    def prepare_prefill(self, seqs: list[BDSequence]):
         input_ids: list[int] = []
         positions: list[int] = []
         cu_seqlens_q = [0]
@@ -161,22 +52,14 @@ class BlockDiffusionModelRunner(ModelRunnerBase):
         slot_mapping: list[int] = []
         block_tables = None
         context_lens: list[int] = []
-        seq_lens: list[int] = []
 
         for seq in seqs:
-            seq.next_diffusion_step(is_prefill=True)
+            seq.init_diffusion_blocks()
 
             total_seqlen = len(seq)
             input_ids.extend(seq[seq.cached_num_tokens:])
             positions.extend(range(seq.cached_num_tokens, total_seqlen))
-            seq_lens.append(total_seqlen)
             context_lens.append(0)
-            assert len(input_ids) == len(positions), (
-                "prepare_prefill(diffusion): len(input_ids) {len_ids} != len(positions) {len_pos}".format(
-                    len_ids=len(input_ids),
-                    len_pos=len(positions),
-                )
-            )
 
             seqlen_q = total_seqlen - seq.cached_num_tokens
             seqlen_k = total_seqlen
@@ -188,42 +71,31 @@ class BlockDiffusionModelRunner(ModelRunnerBase):
 
             if not seq.block_table:
                 continue
-            for i in range(0, seq.num_prompt_blocks):
+            has_padding_mask = seq.pad_prefix_len > 0
+            for i in range(0, seq.num_prefix_blocks):
                 if seq.block_cache_missed[i]:
-                    start = seq.block_table[i] * self.block_size
-                    if i != seq.num_prompt_blocks - 1:
-                        end = start + self.block_size
+                    if has_padding_mask and i == seq.num_prefix_blocks - 1:
+                        slot_mapping.extend([-1] * self.block_size)
                     else:
-                        end = start + seq.last_block_prompt_num_tokens
-                    slot_mapping.extend(range(start, end))
+                        start = seq.block_table[i] * self.block_size
+                        if i != seq.num_prefix_blocks - 1:
+                            end = start + self.block_size
+                        else:
+                            end = start + seq.prefix_last_block_num_tokens
+                        slot_mapping.extend(range(start, end))
                 else:
                     slot_mapping.extend([-1] * self.block_size)
-            slot_mapping.extend([-1] * seq.diffusion_block_size)
 
         block_tables = self.prepare_block_tables(seqs)
 
         input_ids_tensor = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions_tensor = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        seq_lens_ts = torch.tensor(seq_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens_tensor = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_q_tensor = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k_tensor = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping_tensor = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
 
-        assert cu_seqlens_q_tensor[-1].item() == input_ids_tensor.numel(), (
-            "prepare_prefill(diffusion): cu_seqlens_q[-1]={cq} != num_tokens={nt}".format(
-                cq=cu_seqlens_q_tensor[-1].item(),
-                nt=input_ids_tensor.numel(),
-            )
-        )
-        assert cu_seqlens_k_tensor[-1].item() == sum(seq_lens), (
-            "prepare_prefill(diffusion): cu_seqlens_k[-1]={ck} != sum(seq_lens)={sl}".format(
-                ck=cu_seqlens_k_tensor[-1].item(),
-                sl=sum(seq_lens),
-            )
-        )
-
-        set_block_diffusion_attn_metadata(
+        set_bd_attn_metadata(
             True,
             cu_seqlens_q=cu_seqlens_q_tensor,
             cu_seqlens_k=cu_seqlens_k_tensor,
@@ -232,121 +104,59 @@ class BlockDiffusionModelRunner(ModelRunnerBase):
             slot_mapping=slot_mapping_tensor,
             context_lens=context_lens_tensor,
             block_tables=block_tables,
-            seqs=seqs,
+            diffusion_block_size=self.diffusion_block_size,
             kv_cache_layout=self.config.kv_cache_layout,
-            seq_lens=seq_lens,
-            seq_lens_ts=seq_lens_ts,
+            attn_type="block_attention",
+            decode_mode="static",
         )
         return input_ids_tensor, positions_tensor
 
-    def prepare_decode(self, seqs: list[BlockDiffusionSequence]):
+    def prepare_decode(self, seqs: list[BDSequence]):
         input_ids: list[int] = []
         positions: list[int] = []
         cu_seqlens_q = [0]
         cu_seqlens_k = [0]
         slot_mapping: list[int] = []
         context_lens: list[int] = []
-        seq_lens: list[int] = []
-        seq_id_to_queue_id: dict[int, int] = {}
         need_kv_cache_store = False
         max_seqlen_q = 0
         max_seqlen_k = 0
 
-        for seq_idx_in_queue, seq in enumerate(seqs):
-            seq_id = seq.seq_id
-            seq_id_to_queue_id[seq_id] = seq_idx_in_queue
+        for seq in seqs:
             seq.next_diffusion_step()
+            
             cur_input_ids, cur_positions, cur_context_len = seq.diffusion_decoding_inputs()
 
-            seq_lens.append(len(cur_input_ids))
             input_ids.extend(cur_input_ids)
             positions.extend(cur_positions)
             context_lens.append(cur_context_len)
 
-            total_seqlen = len(seq)
-            seqlen_q = total_seqlen - seq.cached_num_tokens
-            seqlen_k = total_seqlen
+            seqlen_q = self.diffusion_block_size
+            seqlen_k = self.diffusion_block_size
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
 
-            mem_block_to_diffusion_blocks_map = seq.mem_block_to_diffusion_blocks_map
-            context_len = context_lens[seq_id_to_queue_id[seq_id]]
-            for mem_block_idx in range(0, seq.num_blocks):
-                start_idx = mem_block_idx * seq.block_size
-                end_idx = start_idx + seq.block_size
-                cur_map = mem_block_to_diffusion_blocks_map[mem_block_idx]
-                is_last_block = False
-                meet_active_block = False
-                while start_idx < end_idx and not is_last_block and not meet_active_block:
-                    local_start_idx = lambda: start_idx % seq.block_size
-                    diffusion_block = seq.diffusion_blocks[cur_map[local_start_idx()]]
-                    if diffusion_block.block_id == 0 and diffusion_block.cursor != start_idx:
-                        diffusion_block.cursor = start_idx
-                    if cur_map[local_start_idx()] == seq.num_diffusion_blocks - 1:
-                        is_last_block = True
-
-                    def get_step(diff_blk, begin_idx):
-                        remaining = diff_blk.remaining_length(begin_idx)
-                        if remaining + local_start_idx() <= seq.block_size:
-                            return remaining
-                        return seq.block_size - local_start_idx()
-
-                    if diffusion_block.is_in_cache:
-                        step = get_step(diffusion_block, start_idx)
-                        diffusion_block.cursor += step
-                        start_idx += step
-                    elif diffusion_block.is_to_cache:
-                        step = get_step(diffusion_block, start_idx)
-                        diffusion_block.cursor += step
-                        cur_diffusion_block_start = 0
-                        cur_diffusion_block_end = step
-                        start_idx += step
-                        mem_block_start = (
-                            seq.block_table[mem_block_idx] * self.block_size
-                            + context_len % seq.block_size
-                        )
-                        context_len += step
-                        slot_mapping.extend(
-                            range(
-                                mem_block_start + cur_diffusion_block_start,
-                                mem_block_start + cur_diffusion_block_end,
-                            )
-                        )
-                        need_kv_cache_store = True
-                    elif diffusion_block.is_active:
-                        meet_active_block = True
-
-                if meet_active_block:
-                    active = seq.active_blocks
-                    first_active_idx = next((i for i, v in enumerate(active) if v), None)
-                    if first_active_idx is not None:
-                        num_blocks_to_pad = len(active) - first_active_idx
-                        slot_mapping.extend([-1] * (num_blocks_to_pad * seq.diffusion_block_size))
-                    break
-            assert len(input_ids) == len(positions), (
-                "Input IDs length {len_ids} does not match positions length {len_pos}".format(
-                    len_ids=len(input_ids),
-                    len_pos=len(positions),
-                )
-            )
-            assert len(input_ids) == len(slot_mapping), (
-                "Input IDs length {len_ids} does not match slot mapping length {len_slot}".format(
-                    len_ids=len(input_ids),
-                    len_slot=len(slot_mapping),
-                )
-            )
-
+            if seq.diffusion_blocks[-1].is_active:
+                slot_mapping.extend([-1] * self.diffusion_block_size)
+            elif seq.diffusion_blocks[-1].is_to_cache:
+                need_kv_cache_store = True
+                num_pages_storing = seq.num_page_blocks_in_active_diffusion_block
+                total_num_pages = len(seq.block_table)
+                for i in range(0, num_pages_storing):
+                    start = seq.block_table[total_num_pages - num_pages_storing + i] * self.block_size
+                    end = start + self.block_size
+                    slot_mapping.extend(range(start, end))
+                
         input_ids_tensor = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions_tensor = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        seq_lens_ts = torch.tensor(seq_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_q_tensor = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k_tensor = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping_tensor = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens_tensor = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
-        set_block_diffusion_attn_metadata(
+        set_bd_attn_metadata(
             False,
             slot_mapping=slot_mapping_tensor,
             context_lens=context_lens_tensor,
@@ -355,12 +165,10 @@ class BlockDiffusionModelRunner(ModelRunnerBase):
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
             block_tables=block_tables,
-            seqs=seqs,
-            seq_lens=seq_lens,
-            seq_lens_ts=seq_lens_ts,
+            page_block_size=self.config.kvcache_block_size,
+            diffusion_block_size=self.diffusion_block_size,
             kv_cache_layout=self.config.kv_cache_layout,
             need_kv_cache_store=need_kv_cache_store,
-            block_diffusion_pp=True,
         )
         return input_ids_tensor, positions_tensor
 
@@ -368,50 +176,99 @@ class BlockDiffusionModelRunner(ModelRunnerBase):
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
             return self.model.compute_logits(self.model(input_ids, positions))
-        bs = input_ids.size(0)
-        context = fetch_block_diffusion_attn_metadata()
-        graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
+        num_tokens = input_ids.size(0)
+        context = fetch_bd_attn_metadata()
+        graph = self.graphs[next(x for x in self.graph_bs if x >= num_tokens)]
         graph_vars = self.graph_vars
         for key, value in graph_vars.items():
             if key != "outputs":
                 value.zero_()
-        graph_vars["input_ids"][:bs] = input_ids
-        graph_vars["positions"][:bs] = positions
-        graph_vars["slot_mapping"][:bs] = context.slot_mapping
-        graph_vars["context_lens"][:bs] = context.context_lens
-        graph_vars["block_tables"][:bs, : context.block_tables.size(1)] = context.block_tables
+        
+        num_seqs = len(context.context_lens)
+        graph_vars["input_ids"][:num_tokens] = input_ids
+        graph_vars["positions"][:num_tokens] = positions
+        graph_vars["slot_mapping"][:num_tokens] = context.slot_mapping
+        graph_vars["context_lens"][:num_seqs] = context.context_lens
+        graph_vars["cu_seqlens_q"][:num_seqs + 1] = context.cu_seqlens_q
+        graph_vars["cu_seqlens_k"][:num_seqs + 1] = context.cu_seqlens_k
+        graph_vars["block_tables"][:num_seqs, : context.block_tables.size(1)] = context.block_tables
         graph.replay()
-        return self.model.compute_logits(graph_vars["outputs"][:bs])
-
-    @torch.inference_mode()
-    def run_verbose(self, seqs: list[SequenceBase], is_prefill: bool) -> list[int]:
-        print("= =" * 20)
-        print(f"Running {'prefill' if is_prefill else 'decode'} for {len(seqs)} sequences on rank {self.rank}")
-        start = time.time()
-        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        print(f"Prepared input in {time.time() - start:.2f} seconds")
-        start = time.time()
-        logits = self.run_model(input_ids, positions, is_prefill)
-        print(f"Ran model in {time.time() - start:.2f} seconds")
-        start = time.time()
-        sample_output = self.sampler(logits, temperatures) if self.rank == 0 else None
-        print(f"Sampled tokens in {time.time() - start:.2f} seconds")
-        reset_block_diffusion_attn_metadata()
-        return sample_output
+        return self.model.compute_logits(graph_vars["outputs"][:num_tokens])
 
     def run(self, seqs: list[SequenceBase], is_prefill: bool) -> list[int]:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         logits = self.run_model(input_ids, positions, is_prefill)
-        sample_output = self.sampler(logits, temperatures) if self.rank == 0 else None
-        reset_block_diffusion_attn_metadata()
+        sample_output = self.sampler(seqs, logits, temperatures) if self.rank == 0 else None
+        reset_bd_attn_metadata()
         return sample_output
 
     @torch.inference_mode()
     def capture_cudagraph(self):
-        """
-        TODO: Varlen decoding does not support CUDA graph capture yet.
-        Can be implemented, but requires drastically high overhead.
-        """
-        raise NotImplementedError("CUDA graph capture for DiffusionLM is not implemented yet.")
+        config = self.config
+        hf_config = config.hf_config
+        max_num_seqs = min(self.config.max_num_seqs, 512)
+        max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
+        diffusion_block_size = self.diffusion_block_size
+        
+        max_num_tokens = max_num_seqs * diffusion_block_size
+        
+        input_ids = torch.zeros(max_num_tokens, dtype=torch.int64)
+        positions = torch.zeros(max_num_tokens, dtype=torch.int64)
+        slot_mapping = torch.zeros(max_num_tokens, dtype=torch.int32)
+        context_lens = torch.zeros(max_num_seqs, dtype=torch.int32)
+        block_tables = torch.zeros(max_num_seqs, max_num_blocks, dtype=torch.int32)
+        outputs = torch.zeros(max_num_tokens, hf_config.hidden_size)
+        
+        cu_seqlens_q = torch.zeros(max_num_seqs + 1, dtype=torch.int32)
+        for i in range(max_num_seqs + 1):
+            cu_seqlens_q[i] = i * diffusion_block_size
+        
+        cu_seqlens_k = torch.zeros(max_num_seqs + 1, dtype=torch.int32)
+        for i in range(max_num_seqs + 1):
+            cu_seqlens_k[i] = i * config.max_model_len
+        
+        self.graph_bs = []
+        seq_bs_list = [1, 2, 4, 8] + list(range(16, max_num_seqs + 1, 16))
+        for num_seqs in seq_bs_list:
+            self.graph_bs.append(num_seqs * diffusion_block_size)
+        self.graphs = {}
+        self.graph_pool = None
+
+        for num_tokens in reversed(self.graph_bs):
+            num_seqs = num_tokens // diffusion_block_size
+            graph = torch.cuda.CUDAGraph()
+            
+            set_bd_attn_metadata(
+                False,
+                slot_mapping=slot_mapping[:num_tokens],
+                context_lens=context_lens[:num_seqs],
+                cu_seqlens_q=cu_seqlens_q[:num_seqs + 1],
+                cu_seqlens_k=cu_seqlens_k[:num_seqs + 1],
+                max_seqlen_q=diffusion_block_size,
+                max_seqlen_k=config.max_model_len,
+                block_tables=block_tables[:num_seqs],
+                diffusion_block_size=diffusion_block_size,
+                kv_cache_layout=self.config.kv_cache_layout,
+                need_kv_cache_store=True,
+            )
+            
+            outputs[:num_tokens] = self.model(input_ids[:num_tokens], positions[:num_tokens])    # warmup
+            with torch.cuda.graph(graph, self.graph_pool):
+                outputs[:num_tokens] = self.model(input_ids[:num_tokens], positions[:num_tokens])    # capture
+            if self.graph_pool is None:
+                self.graph_pool = graph.pool()
+            self.graphs[num_tokens] = graph
+            torch.cuda.synchronize()
+            reset_bd_attn_metadata()
+
+        self.graph_vars = dict(
+            input_ids=input_ids,
+            positions=positions,
+            slot_mapping=slot_mapping,
+            context_lens=context_lens,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            block_tables=block_tables,
+            outputs=outputs,
+        )

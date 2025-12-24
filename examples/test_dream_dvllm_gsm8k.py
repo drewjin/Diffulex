@@ -58,12 +58,14 @@ if __name__ == "__main__":
         accept_threshold=0.95,
         complete_threshold=0.9,
         add_new_block_threshold=0.1,
-        kv_cache_layout="unified"
+        kv_cache_layout="unified",
+        decoding_strategy="d2f"
     )
     tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
     sampling_params = SamplingParams(temperature=0.0, max_tokens=256)
     
-    dataset = load_dataset("data/gsm8k", "main")['test']['question'][:]
+    dataset = load_dataset(
+        "gsm8k", "main", split="test")["question"][:10]
     prompts = [tokenizer.bos_token + FEW_SHOTS + p for p in tqdm(dataset)]
     
     output_file = "log/profiles/perf_dvllm_dream_7B.json"
@@ -71,7 +73,7 @@ if __name__ == "__main__":
         os.remove(output_file)
     # with VizTracer(output_file=output_file, file_info=True) as tracer:
     #     outputs = llm.generate(prompts[:5], sampling_params)
-    time.sleep(60)
+    # time.sleep(60)
     s = time.time()
     outputs = LLM.generate(prompts, sampling_params)
     e = time.time()

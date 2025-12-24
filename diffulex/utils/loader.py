@@ -7,7 +7,7 @@ from tqdm import tqdm
 from glob import glob
 from functools import partial
 from safetensors import safe_open
-from diffulex.legacy.config import Config
+from diffulex.config import Config
 
 
 def load_lora_config(lora_path: str) -> dict:

@@ -2,9 +2,8 @@ from __future__ import annotations
 
 from diffulex.config import Config
 from diffulex.engine.scheduler import AutoScheduler, SchedulerBase
-from diffulex.engine.sequence import SequenceBase, SequenceStatus
+from diffulex.engine.sequence import SequenceStatus
 from .sequence import D2FSequence
-from diffulex.layer.sampler import SampleOutputForDiffusionLM
 
 
 @AutoScheduler.register("d2f", is_default=True)
@@ -19,8 +18,8 @@ class D2FScheduler(SchedulerBase):
     def add(self, seq: D2FSequence) -> None:
         self.waiting.append(seq)
 
-    def schedule(self) -> tuple[list[SequenceBase], bool]:
-        scheduled: list[SequenceBase] = []
+    def schedule(self) -> tuple[list[D2FSequence], bool]:
+        scheduled: list[D2FSequence] = []
         num_seqs = 0
         num_batched_tokens = 0
         while self.waiting and num_seqs < self.max_num_seqs:
@@ -91,7 +90,7 @@ class D2FScheduler(SchedulerBase):
     def postprocess(
         self,
         seqs: list[D2FSequence],
-        sample_output: SampleOutputForDiffusionLM,
+        sample_output,
     ) -> dict[int, int]:
         n_diff_steps: dict[int, int] = {}
         for seq in seqs:

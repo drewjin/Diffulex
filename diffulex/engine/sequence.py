@@ -29,7 +29,6 @@ class SequenceBase:
         self.status = SequenceStatus.WAITING
         self.token_ids = copy(token_ids)
         self.last_token = token_ids[-1]
-        self.num_tokens = len(token_ids)
         self.num_prompt_tokens = len(token_ids)
         self.num_cached_tokens = 0
         self.block_table: list[int] = []
@@ -38,12 +37,17 @@ class SequenceBase:
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
         self.new_tokens = 0
-
+        self.meet_eos = False
+    
     def __len__(self) -> int:
         return self.num_tokens
 
     def __getitem__(self, key) -> int:
         return self.token_ids[key]
+    
+    @property
+    def num_tokens(self) -> int:
+        return len(self.token_ids)
 
     @property
     def is_finished(self) -> bool:
