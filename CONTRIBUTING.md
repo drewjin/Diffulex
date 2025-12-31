@@ -1,6 +1,6 @@
 # Contributing
 
-That would be awesome if you want to contribute something to TileLang!
+That would be awesome if you want to contribute something to Diffulex!
 
 ## Table of Contents  <!-- omit in toc --> <!-- markdownlint-disable heading-increment -->
 
@@ -16,7 +16,7 @@ That would be awesome if you want to contribute something to TileLang!
 
 ## Report Bugs
 
-If you run into any weird behavior while using TileLang, feel free to open a new issue in this repository! Please run a **search before opening** a new issue, to make sure that someone else hasn't already reported or solved the bug you've found.
+If you run into any weird behavior while using Diffulex, feel free to open a new issue in this repository! Please run a **search before opening** a new issue, to make sure that someone else hasn't already reported or solved the bug you've found.
 
 Any issue you open must include:
 
@@ -29,24 +29,24 @@ Please ask questions in issues.
 
 ## Submit Pull Requests
 
-All pull requests are super welcomed and greatly appreciated! Issues in need of a solution are marked with a [`♥ help`](https://github.com/ianstormtaylor/TileLang/issues?q=is%3Aissue+is%3Aopen+label%3A%22%E2%99%A5+help%22) label if you're looking for somewhere to start.
+All pull requests are super welcomed and greatly appreciated! Issues in need of a solution are marked with a [`♥ help`](https://github.com/zhijie-group/Diffulex/issues?q=is%3Aissue+is%3Aopen+label%3A%22%E2%99%A5+help%22) label if you're looking for somewhere to start.
 
-If you're new to contributing to TileLang, you can follow the following guidelines before submitting a pull request.
+If you're new to contributing to Diffulex, you can follow the following guidelines before submitting a pull request.
 
 > [!NOTE]
 > Please include tests and docs with every pull request if applicable!
 
 ## Setup Development Environment
 
-Before contributing to TileLang, please follow the instructions below to setup.
+Before contributing to Diffulex, please follow the instructions below to setup.
 
-1. Fork TileLang ([fork](https://github.com/tile-ai/tilelang/fork)) on GitHub and clone the repository.
+1. Fork Diffulex ([fork](https://github.com/zhijie-group/Diffulex/fork)) on GitHub and clone the repository.
 
     ```bash
-    git clone --recurse-submodules git@github.com:<your username>/tilelang.git  # use the SSH protocol
-    cd tilelang
+    git clone --recurse-submodules git@github.com:<your username>/Diffulex.git  # use the SSH protocol
+    cd Diffulex
 
-    git remote add upstream git@github.com:tile-ai/tilelang.git
+    git remote add upstream git@github.com:zhijie-group/Diffulex.git
     ```
 
 2. Setup a development environment:
@@ -65,11 +65,11 @@ Before contributing to TileLang, please follow the instructions below to setup.
     pre-commit install --install-hooks
     ```
 
-Then you are ready to rock. Thanks for contributing to TileLang!
+Then you are ready to rock. Thanks for contributing to Diffulex!
 
 ## Install Develop Version
 
-To install TileLang in an "editable" mode, run:
+To install Diffulex in an "editable" mode, run:
 
 ```bash
 python3 -m pip install --no-build-isolation --verbose --editable .
@@ -78,10 +78,10 @@ python3 -m pip install --no-build-isolation --verbose --editable .
 in the main directory. This installation is removable by:
 
 ```bash
-python3 -m pip uninstall tilelang
+python3 -m pip uninstall diffulex
 ```
 
-We also recommend installing TileLang in a more manual way for better control over the build process, by compiling the C++ extensions first and set the `PYTHONPATH`. See [Working from Source via `PYTHONPATH`](https://tilelang.com/get_started/Installation.html#working-from-source-via-pythonpath) for detailed instructions.
+We also recommend installing Diffulex in a more manual way for better control over the build process, by compiling the C++ extensions first and set the `PYTHONPATH`. See the documentation for detailed instructions.
 
 ## Lint Check
 
