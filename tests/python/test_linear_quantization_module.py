@@ -134,3 +134,36 @@ def test_linear_int8_w8a16_forward():
     assert error.item() < 0.5, f"Forward error too large: {error.item()}"
 
 
+def test_linear_int8_w8a16_lazy_cache():
+    """Test that W8A16 strategy caches quantized weights to avoid re-quantization."""
+    from diffulex.utils.quantization.registry import create_linear_strategy
+    import torch
+
+    strategy = create_linear_strategy(weight_dtype="int8", act_dtype="bf16")
+    
+    # Initial cache should be empty
+    assert len(strategy._weight_cache) == 0
+    
+    weight = torch.randn(8, 4, dtype=torch.bfloat16)
+    x = torch.randn(2, 4, dtype=torch.bfloat16)
+    
+    # First forward - should cache
+    y1 = strategy.linear_forward(x, weight, None, quant_kind="test")
+    assert len(strategy._weight_cache) == 1
+    assert id(weight) in strategy._weight_cache
+    
+    # Second forward with same weight - should use cache (same output)
+    y2 = strategy.linear_forward(x, weight, None, quant_kind="test")
+    assert len(strategy._weight_cache) == 1  # Cache size unchanged
+    assert torch.allclose(y1, y2), "Cached forward should produce same output"
+    
+    # Different weight - should cache new entry
+    weight2 = torch.randn(8, 4, dtype=torch.bfloat16)
+    y3 = strategy.linear_forward(x, weight2, None, quant_kind="test")
+    assert len(strategy._weight_cache) == 2  # New entry cached
+    
+    # Clear cache
+    strategy.clear_cache()
+    assert len(strategy._weight_cache) == 0
+
+

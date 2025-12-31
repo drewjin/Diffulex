@@ -29,7 +29,17 @@ class LinearInt8W8A16Strategy(LinearQuantizationStrategy):
     Current implementation: Python reference using dequantized weights + F.linear.
     Weight quantization: per-output-channel symmetric quantization to int8.
     Activation: kept as bf16 (no activation quantization).
+    
+    Lazy cache: Quantized weights are cached per weight tensor (by id) to avoid
+    re-quantizing on every forward pass.
     """
+    
+    def __init__(self):
+        """Initialize strategy with empty weight cache."""
+        super().__init__()
+        # Cache: weight_id -> (quantized_weight, scales)
+        # Using id(weight) as key since the same Parameter object is reused across forwards
+        self._weight_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
 
     @property
     def name(self) -> str:
@@ -151,21 +161,42 @@ class LinearInt8W8A16Strategy(LinearQuantizationStrategy):
     ) -> torch.Tensor:
         """Compute Linear output using quantized weights (W8A16).
         
-        Current implementation:
-        1. Quantize weight to int8 (per-channel)
-        2. Dequantize back to bf16
-        3. Call F.linear with dequantized weight
+        Current implementation with lazy cache:
+        1. Check cache for quantized weight (by weight tensor id)
+        2. If not cached, quantize weight to int8 (per-channel) and cache it
+        3. Dequantize back to bf16
+        4. Call F.linear with dequantized weight
         
         Future: Replace with custom int8 GEMM kernel.
         """
         _ = quant_kind, kwargs
         
-        # Quantize weight
-        quantized_weight, scales = self.quantize_weight_for_kernel(weight, device=x.device)
+        # Lazy cache: use weight tensor id as key
+        weight_id = id(weight)
+        
+        # Check cache
+        if weight_id in self._weight_cache:
+            quantized_weight, scales = self._weight_cache[weight_id]
+            # Ensure cached tensors are on the correct device
+            if quantized_weight.device != x.device:
+                quantized_weight = quantized_weight.to(device=x.device)
+                scales = scales.to(device=x.device)
+        else:
+            # Quantize weight and cache it
+            quantized_weight, scales = self.quantize_weight_for_kernel(weight, device=x.device)
+            # Cache the quantized weight and scales
+            self._weight_cache[weight_id] = (quantized_weight, scales)
         
         # Dequantize for reference implementation
         dequantized_weight = self.dequantize(quantized_weight, scales)
         
         # Compute linear output
         return F.linear(x, dequantized_weight, bias)
+    
+    def clear_cache(self) -> None:
+        """Clear the weight quantization cache.
+        
+        Useful for memory management or when weights are updated (e.g., fine-tuning).
+        """
+        self._weight_cache.clear()
 
