@@ -31,6 +31,7 @@ def _dp_child_entry(config: Config, dp_idx: int, local_devices: list[int], conn)
             model=config.model,
             lora_path=config.lora_path,
             model_name=config.model_name,
+            decoding_strategy=config.decoding_strategy,
             mask_token_id=config.mask_token_id,
             diffusion_block_size=config.diffusion_block_size,
             accept_threshold=config.accept_threshold,
