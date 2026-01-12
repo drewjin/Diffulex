@@ -8,7 +8,6 @@ from typing import Optional
 
 from diffulex.utils.quantization.context import QuantizationContext
 from diffulex.utils.quantization.config import QuantizationConfig
-from diffulex.utils.quantization.registry import create_attn_q_strategy as _create_attn_q_strategy
 from diffulex.utils.quantization.registry import create_kv_cache_strategy as _create_kv_cache_strategy
 from diffulex.utils.quantization.registry import create_linear_strategy as _create_linear_strategy
 from diffulex.utils.quantization.strategy import KVCacheQuantizationStrategy
@@ -62,10 +61,6 @@ class QuantizationStrategyFactory:
         # KV Cache strategy
         strategy = QuantizationStrategyFactory.create_kv_cache_strategy(quant_cfg.kv_cache.dtype)
         ctx.set_strategy('kv_cache', strategy)
-
-        # Attention-Q strategy (activation)
-        attn_q_strategy = _create_attn_q_strategy(quant_cfg.activations.attn_q_dtype)
-        ctx.set_strategy('attn_q', attn_q_strategy)
 
         # Linear strategies (weights + activations) by kind
         linear_attn = _create_linear_strategy(

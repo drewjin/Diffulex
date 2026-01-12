@@ -955,30 +955,18 @@ def dllm_flash_attn_prefill(
     Returns:
         Output tensor [Q_LEN, NUM_HEADS, HEAD_DIM]
     """
-    from diffulex.utils.quantization.context import get_kv_cache_strategy, get_attn_q_strategy
+    from diffulex.utils.quantization.context import get_kv_cache_strategy
     kv_strategy = get_kv_cache_strategy()
     kv_fmt = getattr(kv_strategy, "kv_cache_format", "bf16") if kv_strategy is not None else "bf16"
 
-    q_strategy = get_attn_q_strategy()
-    q_fmt = getattr(q_strategy, "attn_q_format", "bf16") if q_strategy is not None else "bf16"
-
-    # Allow activation strategy to populate metadata (e.g. q_scale) and/or transform Q.
-    if q_strategy is not None:
-        q_scale = q_strategy.maybe_compute_q_scale(q, device=q.device)
-        q_strategy.maybe_set_attn_metadata_q_scale(attn_metadata, q_scale=q_scale)
-        q = q_strategy.quantize_q_for_kernel(q, q_scale=q_scale)
+    # Q always uses BF16 (attn_q quantization is not supported)
+    q_fmt = "bf16"
 
     # Prefill currently uses BF16 kernels for all formats (FP8 prefill kernel TBD).
     if q_fmt == "bf16" and kv_fmt in ("bf16", "fp8"):
         return _dllm_flash_attn_prefill_bf16(q, k, v, scale, attn_metadata)
-    if q_fmt == "fp8":
-        raise NotImplementedError(
-            "attn_q_dtype='fp8' is wired for dynamic dispatch but the matching attention kernels "
-            "are not implemented yet. Please keep attn_q_dtype='bf16' for now."
-        )
     raise ValueError(
-        f"Unsupported attn_q_format={q_fmt!r} / kv_cache_format={kv_fmt!r} for prefill "
-        f"(q_strategy={type(q_strategy)}, kv_strategy={type(kv_strategy)})"
+        f"Unsupported q_format={q_fmt!r} / kv_cache_format={kv_fmt!r} for prefill"
     )
 
 
@@ -1012,28 +1000,17 @@ def dllm_flash_attn_decode(
         - Unified layout varlen mode: dequantization is handled by load_kvcache (Python path)
         - Distinct layout: dequantization is handled by load_kvcache (Python path)
     """
-    from diffulex.utils.quantization.context import get_kv_cache_strategy, get_attn_q_strategy
+    from diffulex.utils.quantization.context import get_kv_cache_strategy
     kv_strategy = get_kv_cache_strategy()
     kv_fmt = getattr(kv_strategy, "kv_cache_format", "bf16") if kv_strategy is not None else "bf16"
 
-    q_strategy = get_attn_q_strategy()
-    q_fmt = getattr(q_strategy, "attn_q_format", "bf16") if q_strategy is not None else "bf16"
-
-    if q_strategy is not None:
-        q_scale = q_strategy.maybe_compute_q_scale(q, device=q.device)
-        q_strategy.maybe_set_attn_metadata_q_scale(attn_metadata, q_scale=q_scale)
-        q = q_strategy.quantize_q_for_kernel(q, q_scale=q_scale)
+    # Q always uses BF16 (attn_q quantization is not supported)
+    q_fmt = "bf16"
 
     if q_fmt == "bf16" and kv_fmt == "bf16":
         return _dllm_flash_attn_decode_bf16(q, k, v, k_cache, v_cache, scale, attn_metadata)
     if q_fmt == "bf16" and kv_fmt == "fp8":
         return _dllm_flash_attn_decode_bf16_q_fp8_kv(q, k, v, k_cache, v_cache, scale, attn_metadata)
-    if q_fmt == "fp8":
-        raise NotImplementedError(
-            "attn_q_dtype='fp8' is wired for dynamic dispatch but the matching attention kernels "
-            "are not implemented yet. Please keep attn_q_dtype='bf16' for now."
-        )
     raise ValueError(
-        f"Unsupported attn_q_format={q_fmt!r} / kv_cache_format={kv_fmt!r} for decode "
-        f"(q_strategy={type(q_strategy)}, kv_strategy={type(kv_strategy)})"
+        f"Unsupported q_format={q_fmt!r} / kv_cache_format={kv_fmt!r} for decode"
     )

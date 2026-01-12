@@ -12,6 +12,18 @@
 - W8A8 + FP8 KV
 - W4A8 + BF16 KV
 - W4A8 + FP8 KV
+- FP8 W8A16 (e4m3) + BF16 KV
+- FP8 W8A16 (e4m3) + FP8 KV
+- FP8 W8A16 (e5m2) + BF16 KV
+- FP8 W8A16 (e5m2) + FP8 KV
+- FP8 W8A8 (e4m3) + BF16 KV
+- FP8 W8A8 (e4m3) + FP8 KV
+- FP8 W8A8 (e5m2) + BF16 KV
+- FP8 W8A8 (e5m2) + FP8 KV
+- GPTQ W4A16 (离线量化) + BF16 KV
+- GPTQ W4A16 (离线量化) + FP8 KV
+- AWQ W4A16 (离线量化) + BF16 KV
+- AWQ W4A16 (离线量化) + FP8 KV
 
 使用方法:
     # 运行所有策略
@@ -32,11 +44,26 @@
     # 只运行 W4A8 相关策略
     python test_quantization_generation.py --w4a8
 
+    # 只运行 FP8 W8A16 相关策略
+    python test_quantization_generation.py --fp8_w8a16
+
+    # 只运行 FP8 W8A8 相关策略
+    python test_quantization_generation.py --fp8_w8a8
+
+    # 只运行 GPTQ 相关策略（需要先运行量化脚本生成离线权重）
+    python test_quantization_generation.py --gptq
+
+    # 只运行 AWQ 相关策略（需要先运行量化脚本生成离线权重）
+    python test_quantization_generation.py --awq
+
     # 自定义选择（用逗号分隔）
     python test_quantization_generation.py --strategies bf16_bf16kv,w8a16_bf16kv
 
     # 只测试某个策略
     python test_quantization_generation.py --strategies w4a16_fp8kv
+
+    # 使用量化后的模型路径（如果先运行了量化脚本）
+    python test_quantization_generation.py --gptq --model-path /path/to/quantized/model
 """
 import os
 import sys
@@ -166,6 +193,106 @@ STRATEGY_CONFIGS = {
         'linear_mlp_act_dtype': 'int8',
         'kv_cache_dtype': 'fp8',
     },
+    # FP8 W8A16 strategies
+    'fp8_w8a16_e4m3_bf16kv': {
+        'name': 'FP8 W8A16 (e4m3) + BF16 KV',
+        'linear_attn_weight_dtype': 'fp8_e4m3',
+        'linear_mlp_weight_dtype': 'fp8_e4m3',
+        'linear_attn_act_dtype': 'bf16',
+        'linear_mlp_act_dtype': 'bf16',
+        'kv_cache_dtype': 'bf16',
+    },
+    'fp8_w8a16_e4m3_fp8kv': {
+        'name': 'FP8 W8A16 (e4m3) + FP8 KV',
+        'linear_attn_weight_dtype': 'fp8_e4m3',
+        'linear_mlp_weight_dtype': 'fp8_e4m3',
+        'linear_attn_act_dtype': 'bf16',
+        'linear_mlp_act_dtype': 'bf16',
+        'kv_cache_dtype': 'fp8',
+    },
+    'fp8_w8a16_e5m2_bf16kv': {
+        'name': 'FP8 W8A16 (e5m2) + BF16 KV',
+        'linear_attn_weight_dtype': 'fp8_e5m2',
+        'linear_mlp_weight_dtype': 'fp8_e5m2',
+        'linear_attn_act_dtype': 'bf16',
+        'linear_mlp_act_dtype': 'bf16',
+        'kv_cache_dtype': 'bf16',
+    },
+    'fp8_w8a16_e5m2_fp8kv': {
+        'name': 'FP8 W8A16 (e5m2) + FP8 KV',
+        'linear_attn_weight_dtype': 'fp8_e5m2',
+        'linear_mlp_weight_dtype': 'fp8_e5m2',
+        'linear_attn_act_dtype': 'bf16',
+        'linear_mlp_act_dtype': 'bf16',
+        'kv_cache_dtype': 'fp8',
+    },
+    # FP8 W8A8 strategies
+    'fp8_w8a8_e4m3_bf16kv': {
+        'name': 'FP8 W8A8 (e4m3) + BF16 KV',
+        'linear_attn_weight_dtype': 'fp8_e4m3',
+        'linear_mlp_weight_dtype': 'fp8_e4m3',
+        'linear_attn_act_dtype': 'fp8_e4m3',
+        'linear_mlp_act_dtype': 'fp8_e4m3',
+        'kv_cache_dtype': 'bf16',
+    },
+    'fp8_w8a8_e4m3_fp8kv': {
+        'name': 'FP8 W8A8 (e4m3) + FP8 KV',
+        'linear_attn_weight_dtype': 'fp8_e4m3',
+        'linear_mlp_weight_dtype': 'fp8_e4m3',
+        'linear_attn_act_dtype': 'fp8_e4m3',
+        'linear_mlp_act_dtype': 'fp8_e4m3',
+        'kv_cache_dtype': 'fp8',
+    },
+    'fp8_w8a8_e5m2_bf16kv': {
+        'name': 'FP8 W8A8 (e5m2) + BF16 KV',
+        'linear_attn_weight_dtype': 'fp8_e5m2',
+        'linear_mlp_weight_dtype': 'fp8_e5m2',
+        'linear_attn_act_dtype': 'fp8_e5m2',
+        'linear_mlp_act_dtype': 'fp8_e5m2',
+        'kv_cache_dtype': 'bf16',
+    },
+    'fp8_w8a8_e5m2_fp8kv': {
+        'name': 'FP8 W8A8 (e5m2) + FP8 KV',
+        'linear_attn_weight_dtype': 'fp8_e5m2',
+        'linear_mlp_weight_dtype': 'fp8_e5m2',
+        'linear_attn_act_dtype': 'fp8_e5m2',
+        'linear_mlp_act_dtype': 'fp8_e5m2',
+        'kv_cache_dtype': 'fp8',
+    },
+    # GPTQ W4A16 strategies (offline quantized)
+    'gptq_w4a16_bf16kv': {
+        'name': 'GPTQ W4A16 (离线量化) + BF16 KV',
+        'linear_attn_weight_dtype': 'gptq',
+        'linear_mlp_weight_dtype': 'gptq',
+        'linear_attn_act_dtype': 'bf16',
+        'linear_mlp_act_dtype': 'bf16',
+        'kv_cache_dtype': 'bf16',
+    },
+    'gptq_w4a16_fp8kv': {
+        'name': 'GPTQ W4A16 (离线量化) + FP8 KV',
+        'linear_attn_weight_dtype': 'gptq',
+        'linear_mlp_weight_dtype': 'gptq',
+        'linear_attn_act_dtype': 'bf16',
+        'linear_mlp_act_dtype': 'bf16',
+        'kv_cache_dtype': 'fp8',
+    },
+    # AWQ W4A16 strategies (offline quantized)
+    'awq_w4a16_bf16kv': {
+        'name': 'AWQ W4A16 (离线量化) + BF16 KV',
+        'linear_attn_weight_dtype': 'awq',
+        'linear_mlp_weight_dtype': 'awq',
+        'linear_attn_act_dtype': 'bf16',
+        'linear_mlp_act_dtype': 'bf16',
+        'kv_cache_dtype': 'bf16',
+    },
+    'awq_w4a16_fp8kv': {
+        'name': 'AWQ W4A16 (离线量化) + FP8 KV',
+        'linear_attn_weight_dtype': 'awq',
+        'linear_mlp_weight_dtype': 'awq',
+        'linear_attn_act_dtype': 'bf16',
+        'linear_mlp_act_dtype': 'bf16',
+        'kv_cache_dtype': 'fp8',
+    },
 }
 
 # 策略组定义
@@ -175,6 +302,26 @@ STRATEGY_GROUPS = {
     'w4a16': ['w4a16_bf16kv', 'w4a16_fp8kv'],
     'w8a8': ['w8a8_bf16kv', 'w8a8_fp8kv'],
     'w4a8': ['w4a8_bf16kv', 'w4a8_fp8kv'],
+    'fp8_w8a16': [
+        'fp8_w8a16_e4m3_bf16kv',
+        'fp8_w8a16_e4m3_fp8kv',
+        'fp8_w8a16_e5m2_bf16kv',
+        'fp8_w8a16_e5m2_fp8kv',
+    ],
+    'fp8_w8a8': [
+        'fp8_w8a8_e4m3_bf16kv',
+        'fp8_w8a8_e4m3_fp8kv',
+        'fp8_w8a8_e5m2_bf16kv',
+        'fp8_w8a8_e5m2_fp8kv',
+    ],
+    'gptq': [
+        'gptq_w4a16_bf16kv',
+        'gptq_w4a16_fp8kv',
+    ],
+    'awq': [
+        'awq_w4a16_bf16kv',
+        'awq_w4a16_fp8kv',
+    ],
     'all': list(STRATEGY_CONFIGS.keys()),
 }
 
@@ -341,7 +488,9 @@ def run_strategy(
     strategy_name = config['name']
     is_w4a16 = 'w4a16' in strategy_key.lower()
     is_w4a8 = 'w4a8' in strategy_key.lower()
-    needs_special_cleanup = is_w4a16 or is_w4a8  # Both W4A16 and W4A8 may need extra cleanup
+    is_gptq = 'gptq' in strategy_key.lower()
+    is_awq = 'awq' in strategy_key.lower()
+    needs_special_cleanup = is_w4a16 or is_w4a8 or is_gptq or is_awq  # W4A16/W4A8/GPTQ/AWQ may need extra cleanup
     
     print("\n" + "=" * 70)
     print(f"测试: {strategy_name}")
@@ -524,6 +673,14 @@ def parse_strategies(args) -> List[str]:
         strategies = STRATEGY_GROUPS['w8a8']
     elif args.w4a8:
         strategies = STRATEGY_GROUPS['w4a8']
+    elif args.fp8_w8a16:
+        strategies = STRATEGY_GROUPS['fp8_w8a16']
+    elif args.fp8_w8a8:
+        strategies = STRATEGY_GROUPS['fp8_w8a8']
+    elif args.gptq:
+        strategies = STRATEGY_GROUPS['gptq']
+    elif args.awq:
+        strategies = STRATEGY_GROUPS['awq']
     elif args.strategies:
         # 手动指定策略，支持逗号分隔
         strategies = [s.strip() for s in args.strategies.split(',')]
@@ -553,8 +710,13 @@ def main():
   %(prog)s --w4a16                  # 只运行 W4A16 相关策略
   %(prog)s --w8a8                   # 只运行 W8A8 相关策略
   %(prog)s --w4a8                   # 只运行 W4A8 相关策略
+  %(prog)s --fp8_w8a16              # 只运行 FP8 W8A16 相关策略
+  %(prog)s --fp8_w8a8               # 只运行 FP8 W8A8 相关策略
+  %(prog)s --gptq                   # 只运行 GPTQ W4A16 相关策略（需要先运行量化脚本）
+  %(prog)s --awq                    # 只运行 AWQ W4A16 相关策略（需要先运行量化脚本）
   %(prog)s --strategies bf16_bf16kv,w8a16_bf16kv  # 自定义选择
   %(prog)s --strategies w4a16_fp8kv --max-tokens 50  # 指定策略和参数
+  %(prog)s --gptq --model-path /path/to/quantized/model  # 使用量化后的模型路径
         """
     )
     
@@ -566,6 +728,10 @@ def main():
     strategy_group.add_argument('--w4a16', action='store_true', help='只运行 W4A16 相关策略')
     strategy_group.add_argument('--w8a8', action='store_true', help='只运行 W8A8 相关策略')
     strategy_group.add_argument('--w4a8', action='store_true', help='只运行 W4A8 相关策略')
+    strategy_group.add_argument('--fp8_w8a16', action='store_true', help='只运行 FP8 W8A16 相关策略')
+    strategy_group.add_argument('--fp8_w8a8', action='store_true', help='只运行 FP8 W8A8 相关策略')
+    strategy_group.add_argument('--gptq', action='store_true', help='只运行 GPTQ W4A16 相关策略（需要先运行量化脚本生成离线权重）')
+    strategy_group.add_argument('--awq', action='store_true', help='只运行 AWQ W4A16 相关策略（需要先运行量化脚本生成离线权重）')
     strategy_group.add_argument('--strategies', type=str, help='手动指定策略（逗号分隔），例如: bf16_bf16kv,w8a16_fp8kv')
     
     # 其他选项
@@ -626,13 +792,15 @@ def main():
     }
     
     # 运行所有选定的策略
-    # 对于 W4A16/W4A8 策略，调整运行顺序：先运行其他策略，再运行 W4A16/W4A8 策略
+    # 对于 W4A16/W4A8/GPTQ/AWQ 策略，调整运行顺序：先运行其他策略，再运行这些策略
     # 这样可以避免在运行其他策略后资源状态不一致导致的问题
-    w4a16_strategies = [s for s in strategies if 'w4a16' in s.lower()]
+    w4a16_strategies = [s for s in strategies if 'w4a16' in s.lower() and 'gptq' not in s.lower() and 'awq' not in s.lower()]
     w4a8_strategies = [s for s in strategies if 'w4a8' in s.lower()]
-    other_strategies = [s for s in strategies if 'w4a16' not in s.lower() and 'w4a8' not in s.lower()]
-    # 先运行其他策略，再运行 W4A16 策略，最后运行 W4A8 策略（如果存在）
-    ordered_strategies = other_strategies + w4a16_strategies + w4a8_strategies
+    gptq_strategies = [s for s in strategies if 'gptq' in s.lower()]
+    awq_strategies = [s for s in strategies if 'awq' in s.lower()]
+    other_strategies = [s for s in strategies if 'w4a16' not in s.lower() and 'w4a8' not in s.lower() and 'gptq' not in s.lower() and 'awq' not in s.lower()]
+    # 先运行其他策略，再运行 W4A16 策略，然后 W4A8，最后 GPTQ/AWQ 策略（如果存在）
+    ordered_strategies = other_strategies + w4a16_strategies + w4a8_strategies + gptq_strategies + awq_strategies
     
     results = {}
     isolate = (len(ordered_strategies) > 1) and (not args.no_isolate) and (not args._emit_json)

@@ -20,7 +20,6 @@ class _AttnMetaDataLike(Protocol):
 
     k_scale: Optional[torch.Tensor]
     v_scale: Optional[torch.Tensor]
-    q_scale: Optional[torch.Tensor]
 
 
 class QuantizationStrategy(ABC):
@@ -237,58 +236,6 @@ class WeightQuantizationStrategy(QuantizationStrategy):
             Dequantized weight tensor.
         """
         pass
-
-
-class AttnQQuantizationStrategy(QuantizationStrategy):
-    """Attention-Q quantization strategy interface (activation quantization)."""
-
-    @property
-    def attn_q_format(self) -> str:
-        """Small tag used for kernel dispatch.
-
-        Known values:
-        - "bf16": Q remains BF16 (default)
-        - "fp8": Q is FP8 (kernel not implemented yet; placeholder)
-        """
-        return "bf16"
-
-    @property
-    def requires_q_scales(self) -> bool:
-        return self.requires_runtime_scales
-
-    def maybe_set_attn_metadata_q_scale(
-        self,
-        attn_metadata: _AttnMetaDataLike,
-        *,
-        q_scale: Optional[torch.Tensor],
-    ) -> None:
-        """Populate `attn_metadata.q_scale` when needed."""
-        if not self.requires_q_scales:
-            return
-        if q_scale is None:
-            raise ValueError(f"{self.name} requires q_scale but got None")
-        attn_metadata.q_scale = q_scale
-
-    def maybe_compute_q_scale(
-        self,
-        q: torch.Tensor,
-        *,
-        device: torch.device,
-    ) -> Optional[torch.Tensor]:
-        """Optionally compute Q scale tensor for the current call."""
-        return None
-
-    def quantize_q_for_kernel(
-        self,
-        q: torch.Tensor,
-        *,
-        q_scale: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        """Return a Q tensor to be consumed by the chosen attention kernel.
-
-        Default behavior: no-op (returns BF16/FP16/FP32 Q as-is).
-        """
-        return q
 
 
 class LinearQuantizationStrategy(QuantizationStrategy):

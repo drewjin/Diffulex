@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -85,24 +87,149 @@ class LinearBase(nn.Module):
         self.register_buffer("quant_weight_int8", torch.empty(0, dtype=torch.int8), persistent=False)
         self.register_buffer("quant_scales", torch.empty(0, dtype=torch.bfloat16), persistent=False)
         self.register_buffer("_weight_is_quantized", torch.tensor(False, dtype=torch.bool), persistent=False)
+        
+        # GPTQ/AWQ offline quantized weight storage (W4A16).
+        # GPTQ: qweight (packed int4), qzeros (packed int4), scales (per-group), g_idx (optional)
+        # AWQ: qweight (packed int4), qzeros (packed int4), scales (per-group)
+        self.register_buffer("gptq_qweight", torch.empty(0, dtype=torch.int8), persistent=False)
+        self.register_buffer("gptq_qzeros", torch.empty(0, dtype=torch.int8), persistent=False)
+        self.register_buffer("gptq_scales", torch.empty(0, dtype=torch.float32), persistent=False)
+        self.register_buffer("gptq_g_idx", torch.empty(0, dtype=torch.int32), persistent=False)
+        self.register_buffer("awq_qweight", torch.empty(0, dtype=torch.int8), persistent=False)
+        self.register_buffer("awq_qzeros", torch.empty(0, dtype=torch.int8), persistent=False)
+        self.register_buffer("awq_scales", torch.empty(0, dtype=torch.float32), persistent=False)
+        # Metadata for offline quantized weights
+        self.register_buffer("_offline_quant_format", torch.empty(0, dtype=torch.int8), persistent=False)  # 0=none, 1=gptq, 2=awq
+        self.register_buffer("_offline_quant_group_size", torch.tensor(128, dtype=torch.int32), persistent=False)
+        self.register_buffer("_offline_quant_out_features", torch.tensor(0, dtype=torch.int32), persistent=False)
+        self.register_buffer("_offline_quant_in_features", torch.tensor(0, dtype=torch.int32), persistent=False)
 
     def has_quantized_weight(self) -> bool:
         return bool(self._weight_is_quantized.item()) and self.quant_weight_int8.numel() > 0 and self.quant_scales.numel() > 0
 
+    def has_offline_quantized_weight(self) -> bool:
+        """Check if offline quantized weights (GPTQ/AWQ) are present."""
+        format_val = int(self._offline_quant_format.item()) if self._offline_quant_format.numel() > 0 else 0
+        if format_val == 1:  # GPTQ
+            return (
+                self.gptq_qweight.numel() > 0
+                and self.gptq_qzeros.numel() > 0
+                and self.gptq_scales.numel() > 0
+            )
+        elif format_val == 2:  # AWQ
+            return (
+                self.awq_qweight.numel() > 0
+                and self.awq_qzeros.numel() > 0
+                and self.awq_scales.numel() > 0
+            )
+        return False
+
+    def set_offline_quantized_weight(
+        self,
+        format: str,
+        qweight: torch.Tensor,
+        qzeros: torch.Tensor,
+        scales: torch.Tensor,
+        *,
+        out_features: int,
+        in_features: int,
+        group_size: int = 128,
+        g_idx: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Set offline quantized weights (GPTQ or AWQ format).
+
+        Args:
+            format: "gptq" or "awq"
+            qweight: int8 packed int4 weights [out_features, (in_features + 1) // 2]
+            qzeros: int8 packed int4 zeros [num_groups, (in_features + 1) // 2]
+            scales: float32 per-group scales [num_groups, in_features] or [num_groups]
+            out_features: Output features (N)
+            in_features: Input features (K)
+            group_size: Group size for quantization (default: 128)
+            g_idx: Optional int32 tensor [out_features] for GPTQ group indices (GPTQ only)
+        """
+        format = format.strip().lower()
+        if format not in ("gptq", "awq"):
+            raise ValueError(f"Unsupported offline quant format: {format}. Supported: 'gptq', 'awq'")
+
+        if qweight.dtype != torch.int8:
+            raise TypeError(f"qweight must be int8, got {qweight.dtype}")
+        if qzeros.dtype != torch.int8:
+            raise TypeError(f"qzeros must be int8, got {qzeros.dtype}")
+        if scales.dtype != torch.float32:
+            scales = scales.to(dtype=torch.float32)
+
+        num_groups = (out_features + group_size - 1) // group_size
+        expected_qweight_shape = (out_features, (in_features + 1) // 2)
+        expected_qzeros_shape = (num_groups, (in_features + 1) // 2)
+
+        if qweight.shape != expected_qweight_shape:
+            raise ValueError(
+                f"qweight shape mismatch: got {qweight.shape}, expected {expected_qweight_shape}"
+            )
+        if qzeros.shape != expected_qzeros_shape:
+            raise ValueError(
+                f"qzeros shape mismatch: got {qzeros.shape}, expected {expected_qzeros_shape}"
+            )
+
+        if format == "gptq":
+            self.gptq_qweight = qweight
+            self.gptq_qzeros = qzeros
+            self.gptq_scales = scales
+            if g_idx is not None:
+                if g_idx.shape != (out_features,):
+                    raise ValueError(
+                        f"g_idx shape mismatch: got {g_idx.shape}, expected ({out_features},)"
+                    )
+                if g_idx.dtype != torch.int32:
+                    g_idx = g_idx.to(dtype=torch.int32)
+                self.gptq_g_idx = g_idx
+            else:
+                # Clear g_idx if not provided
+                self.gptq_g_idx = torch.empty(0, dtype=torch.int32)
+            self._offline_quant_format = torch.tensor(1, dtype=torch.int8)
+        else:  # AWQ
+            self.awq_qweight = qweight
+            self.awq_qzeros = qzeros
+            self.awq_scales = scales
+            # AWQ doesn't use g_idx, clear it
+            self.gptq_qweight = torch.empty(0, dtype=torch.int8)
+            self.gptq_qzeros = torch.empty(0, dtype=torch.int8)
+            self.gptq_scales = torch.empty(0, dtype=torch.float32)
+            self.gptq_g_idx = torch.empty(0, dtype=torch.int32)
+            self._offline_quant_format = torch.tensor(2, dtype=torch.int8)
+
+        self._offline_quant_group_size = torch.tensor(group_size, dtype=torch.int32)
+        self._offline_quant_out_features = torch.tensor(out_features, dtype=torch.int32)
+        self._offline_quant_in_features = torch.tensor(in_features, dtype=torch.int32)
+
+        # Drop bf16 weight Parameter if present (to free memory)
+        if "weight" in self._parameters:
+            self._parameters.pop("weight", None)
+            setattr(self, "weight", None)
+
     def set_quantized_weight(self, quant_weight_int8: torch.Tensor, quant_scales: torch.Tensor) -> None:
-        if quant_weight_int8.dtype != torch.int8:
-            raise TypeError(f"quant_weight_int8 must be int8, got {quant_weight_int8.dtype}")
+        # Support both int8 (for int8/int4 quantization) and uint8 (for FP8 quantization)
+        if quant_weight_int8.dtype not in (torch.int8, torch.uint8):
+            raise TypeError(f"quant_weight_int8 must be int8 or uint8, got {quant_weight_int8.dtype}")
         # Store scales dtype depends on strategy:
         # - W8A16/W4A16 kernels currently take bf16 scales.
         # - W8A8/W4A8 paths are more sensitive to scale precision; keep scales at fp16.
+        # - FP8 W8A16 uses float32 scales.
+        # - FP8 W8A8 uses float16 scales.
         try:
             strategy = get_linear_strategy(self.quant_kind)
         except Exception:
             strategy = None
         scale_dtype = torch.bfloat16
         if strategy is not None:
+            weight_format = getattr(strategy, "linear_weight_format", None)
             act_format = getattr(strategy, "linear_act_format", None)
-            if act_format == "int8":
+            # FP8 W8A16 uses float32 scales
+            if weight_format in ("fp8_e4m3", "fp8_e5m2") and act_format == "bf16":
+                scale_dtype = torch.float32
+            # FP8 W8A8 and int8 W8A8 use float16 scales
+            elif act_format in ("int8", "fp8_e4m3", "fp8_e5m2"):
                 scale_dtype = torch.float16
         if quant_scales.dtype != scale_dtype:
             quant_scales = quant_scales.to(dtype=scale_dtype)
@@ -117,10 +244,10 @@ class LinearBase(nn.Module):
         loaded_shard_id: object = None,
         expected_shard_ids: set[object] | None = None,
     ) -> None:
-        """If current Linear is configured for W8A16/W4A16, quantize the loaded bf16 weight and drop the bf16 Parameter.
+        """If current Linear is configured for quantization, quantize the loaded bf16 weight and drop the bf16 Parameter.
 
         This is called at the end of weight_loader(), after the shard copy is done.
-        Supports both int8 (W8A16) and int4 (W4A16) quantization.
+        Supports int8 (W8A16/W8A8), int4 (W4A16/W4A8), and FP8 (FP8 W8A16/FP8 W8A8) quantization.
         """
         # Only process the real weight Parameter (ignore bias).
         current_weight = self._parameters.get("weight", None)
@@ -143,14 +270,14 @@ class LinearBase(nn.Module):
             return
         weight_format = getattr(strategy, "linear_weight_format", None)
         # NOTE: We intentionally do NOT require act_format == "bf16" here.
-        # For W8A8/W4A8 we still want to quantize+drop the bf16 weight Parameter at load-time.
+        # For W8A8/W4A8/FP8 W8A8 we still want to quantize+drop the bf16 weight Parameter at load-time.
         # But we must avoid doing this for the generic stub strategy (unsupported combos),
         # otherwise we'd drop weights and then raise NotImplementedError at runtime.
         if getattr(strategy, "name", "").startswith("linear_stub"):
             return
         
-        # Support int8/int4 weight formats (W8A16/W8A8 and W4A16/W4A8).
-        if weight_format not in ("int8", "int4"):
+        # Support int8/int4/FP8 weight formats (W8A16/W8A8, W4A16/W4A8, FP8 W8A16/FP8 W8A8).
+        if weight_format not in ("int8", "int4", "fp8_e4m3", "fp8_e5m2"):
             return
 
         # Quantize on the same device as the loaded param (typically CUDA).
@@ -195,7 +322,47 @@ class ReplicatedLinear(LinearBase, LoRAMixin):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         strategy = get_linear_strategy(self.quant_kind)
-        if self.has_quantized_weight():
+        
+        # Check for offline quantized weights (GPTQ/AWQ) first
+        if self.has_offline_quantized_weight():
+            if strategy is None:
+                raise RuntimeError("Offline quantized weight is present but no linear strategy is configured.")
+            format_val = int(self._offline_quant_format.item())
+            out_features = int(self._offline_quant_out_features.item())
+            in_features = int(self._offline_quant_in_features.item())
+            group_size = int(self._offline_quant_group_size.item())
+            
+            kwargs = {
+                "out_features": out_features,
+                "in_features": in_features,
+                "group_size": group_size,
+            }
+            
+            if format_val == 1:  # GPTQ
+                kwargs.update({
+                    "gptq_qweight": self.gptq_qweight,
+                    "gptq_qzeros": self.gptq_qzeros,
+                    "gptq_scales": self.gptq_scales,
+                    "gptq_group_size": group_size,
+                })
+                if self.gptq_g_idx.numel() > 0:
+                    kwargs["gptq_g_idx"] = self.gptq_g_idx
+            elif format_val == 2:  # AWQ
+                kwargs.update({
+                    "awq_qweight": self.awq_qweight,
+                    "awq_qzeros": self.awq_qzeros,
+                    "awq_scales": self.awq_scales,
+                    "awq_group_size": group_size,
+                })
+            
+            base_out = strategy.linear_forward(
+                x,
+                None,  # weight not used for offline quantized weights
+                self.bias,
+                quant_kind=self.quant_kind,
+                **kwargs,
+            )
+        elif self.has_quantized_weight():
             if strategy is None:
                 raise RuntimeError("Quantized weight is present but no linear strategy is configured.")
             # For int4 (W4A16), we need to pass original_in_features
@@ -260,7 +427,47 @@ class ColumnParallelLinear(LinearBase, LoRAMixin):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         strategy = get_linear_strategy(self.quant_kind)
-        if self.has_quantized_weight():
+        
+        # Check for offline quantized weights (GPTQ/AWQ) first
+        if self.has_offline_quantized_weight():
+            if strategy is None:
+                raise RuntimeError("Offline quantized weight is present but no linear strategy is configured.")
+            format_val = int(self._offline_quant_format.item())
+            out_features = int(self._offline_quant_out_features.item())
+            in_features = int(self._offline_quant_in_features.item())
+            group_size = int(self._offline_quant_group_size.item())
+            
+            kwargs = {
+                "out_features": out_features,
+                "in_features": in_features,
+                "group_size": group_size,
+            }
+            
+            if format_val == 1:  # GPTQ
+                kwargs.update({
+                    "gptq_qweight": self.gptq_qweight,
+                    "gptq_qzeros": self.gptq_qzeros,
+                    "gptq_scales": self.gptq_scales,
+                    "gptq_group_size": group_size,
+                })
+                if self.gptq_g_idx.numel() > 0:
+                    kwargs["gptq_g_idx"] = self.gptq_g_idx
+            elif format_val == 2:  # AWQ
+                kwargs.update({
+                    "awq_qweight": self.awq_qweight,
+                    "awq_qzeros": self.awq_qzeros,
+                    "awq_scales": self.awq_scales,
+                    "awq_group_size": group_size,
+                })
+            
+            base_out = strategy.linear_forward(
+                x,
+                None,  # weight not used for offline quantized weights
+                self.bias,
+                quant_kind=self.quant_kind,
+                **kwargs,
+            )
+        elif self.has_quantized_weight():
             if strategy is None:
                 raise RuntimeError("Quantized weight is present but no linear strategy is configured.")
             # For int4 (W4A16), we need to pass original_in_features
@@ -402,7 +609,47 @@ class RowParallelLinear(LinearBase, LoRAMixin):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         bias = self.bias if self.tp_rank == 0 else None
         strategy = get_linear_strategy(self.quant_kind)
-        if self.has_quantized_weight():
+        
+        # Check for offline quantized weights (GPTQ/AWQ) first
+        if self.has_offline_quantized_weight():
+            if strategy is None:
+                raise RuntimeError("Offline quantized weight is present but no linear strategy is configured.")
+            format_val = int(self._offline_quant_format.item())
+            out_features = int(self._offline_quant_out_features.item())
+            in_features = int(self._offline_quant_in_features.item())
+            group_size = int(self._offline_quant_group_size.item())
+            
+            kwargs = {
+                "out_features": out_features,
+                "in_features": in_features,
+                "group_size": group_size,
+            }
+            
+            if format_val == 1:  # GPTQ
+                kwargs.update({
+                    "gptq_qweight": self.gptq_qweight,
+                    "gptq_qzeros": self.gptq_qzeros,
+                    "gptq_scales": self.gptq_scales,
+                    "gptq_group_size": group_size,
+                })
+                if self.gptq_g_idx.numel() > 0:
+                    kwargs["gptq_g_idx"] = self.gptq_g_idx
+            elif format_val == 2:  # AWQ
+                kwargs.update({
+                    "awq_qweight": self.awq_qweight,
+                    "awq_qzeros": self.awq_qzeros,
+                    "awq_scales": self.awq_scales,
+                    "awq_group_size": group_size,
+                })
+            
+            y = strategy.linear_forward(
+                x,
+                None,  # weight not used for offline quantized weights
+                bias,
+                quant_kind=self.quant_kind,
+                **kwargs,
+            )
+        elif self.has_quantized_weight():
             if strategy is None:
                 raise RuntimeError("Quantized weight is present but no linear strategy is configured.")
             # For int4 (W4A16), we must pass original_in_features to disambiguate packed K.

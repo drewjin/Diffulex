@@ -11,7 +11,6 @@ from threading import local
 from diffulex.utils.quantization.strategy import (
     QuantizationStrategy,
     KVCacheQuantizationStrategy,
-    AttnQQuantizationStrategy,
     WeightQuantizationStrategy,
     LinearQuantizationStrategy,
 )
@@ -65,17 +64,6 @@ class QuantizationContext:
             return strategy
         raise TypeError(
             f"Weight strategy must be WeightQuantizationStrategy, got {type(strategy)}"
-        )
-
-    def get_attn_q_strategy(self) -> Optional[AttnQQuantizationStrategy]:
-        """Get Attention-Q quantization strategy."""
-        strategy = self._strategies.get('attn_q')
-        if strategy is None:
-            return None
-        if isinstance(strategy, AttnQQuantizationStrategy):
-            return strategy
-        raise TypeError(
-            f"attn_q strategy must be AttnQQuantizationStrategy, got {type(strategy)}"
         )
 
     def set_linear_strategy(self, kind: str, strategy: LinearQuantizationStrategy) -> None:
@@ -135,18 +123,6 @@ def get_weight_strategy() -> Optional[WeightQuantizationStrategy]:
     """Get weight quantization strategy."""
     ctx = QuantizationContext.current()
     return ctx.get_weight_strategy()
-
-
-def set_attn_q_strategy(strategy: AttnQQuantizationStrategy):
-    """Set Attention-Q quantization strategy."""
-    ctx = QuantizationContext.current()
-    ctx.set_strategy('attn_q', strategy)
-
-
-def get_attn_q_strategy() -> Optional[AttnQQuantizationStrategy]:
-    """Get Attention-Q quantization strategy."""
-    ctx = QuantizationContext.current()
-    return ctx.get_attn_q_strategy()
 
 
 def set_linear_strategy(kind: str, strategy: LinearQuantizationStrategy) -> None:
