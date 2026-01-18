@@ -400,8 +400,6 @@ class LinearBase(nn.Module):
                 marlin_make_workspace_new,
                 marlin_permute_scales,
                 marlin_sort_g_idx,
-                marlin_zero_points,
-                unpack_cols,
             )
         except Exception as e:  # pragma: no cover
             raise RuntimeError(
@@ -510,7 +508,6 @@ class LinearBase(nn.Module):
             from vllm import _custom_ops as ops  # type: ignore
             from vllm.model_executor.layers.quantization.utils.marlin_utils import (  # type: ignore
                 awq_to_marlin_zero_points,
-                marlin_make_empty_g_idx,
                 marlin_make_workspace_new,
                 marlin_permute_scales,
             )
@@ -570,8 +567,6 @@ class LinearBase(nn.Module):
             is_a_8bit=False,
         )
 
-        # g_idx not used for AWQ marlin (keep empty, strategy will pass empties).
-        _ = marlin_make_empty_g_idx  # keep import referenced for clarity
         self._awq_marlin_is_prepared = torch.tensor(True, dtype=torch.bool, device=device)
 
     def set_quantized_weight(self, quant_weight_int8: torch.Tensor, quant_scales: torch.Tensor) -> None:
@@ -707,6 +702,168 @@ class LinearBase(nn.Module):
         # Keep attribute for compatibility, but ensure forward uses quant buffers.
         setattr(self, "weight", None)
 
+    def _get_linear_strategy(self):
+        """Return strategy for current `quant_kind` (or None).
+
+        NOTE: do not swallow TypeError here; a wrong strategy type should fail fast.
+        """
+        return get_linear_strategy(self.quant_kind)
+
+    def _offline_meta(self) -> tuple[int, int, int]:
+        """Return (out_features, in_features, group_size) for offline GPTQ/AWQ."""
+        return (
+            int(self._offline_quant_out_features.item()),
+            int(self._offline_quant_in_features.item()),
+            int(self._offline_quant_group_size.item()),
+        )
+
+    def _infer_gptq_weight_bits(self, *, in_features: int) -> int:
+        """Infer/return GPTQ weight bits for downstream kernels.
+
+        Priority:
+        - use recorded bits (e.g., marlin-exported layouts),
+        - otherwise infer from qweight packing.
+        """
+        bits = int(self._offline_quant_bits.item()) if self._offline_quant_bits.numel() > 0 else 0
+        if bits > 0:
+            return bits
+        if self.gptq_qweight.numel() == 0:
+            raise RuntimeError("GPTQ bits 推断失败：gptq_qweight 为空。")
+        if self.gptq_qweight.shape[0] <= 0 or in_features % int(self.gptq_qweight.shape[0]) != 0:
+            raise RuntimeError(
+                f"GPTQ bits 推断失败：in_features={in_features}, qweight.shape={tuple(self.gptq_qweight.shape)}"
+            )
+        pack_factor = in_features // int(self.gptq_qweight.shape[0])
+        if 32 % pack_factor != 0:
+            raise RuntimeError(f"GPTQ bits 推断失败：pack_factor={pack_factor} 不满足 32%pack_factor==0")
+        return 32 // pack_factor
+
+    def _maybe_int4_original_in_features_kwargs(self, strategy, x: torch.Tensor) -> dict:
+        """Some int4 kernels need original K (before packing)."""
+        if strategy is None:
+            return {}
+        if getattr(strategy, "linear_weight_format", None) == "int4":
+            return {"original_in_features": x.shape[1]}
+        return {}
+
+    def _build_offline_forward_kwargs(self, x: torch.Tensor, strategy) -> dict:
+        """Build kwargs for offline GPTQ/AWQ (including Marlin variants)."""
+        if strategy is None:
+            raise RuntimeError("Offline quantized weight is present but no linear strategy is configured.")
+
+        format_val = int(self._offline_quant_format.item())
+        weight_format = getattr(strategy, "linear_weight_format", None)
+        out_features, in_features, group_size = self._offline_meta()
+
+        meta = {
+            "out_features": out_features,
+            "in_features": in_features,
+            "group_size": group_size,
+        }
+
+        if format_val == 1:  # GPTQ
+            # IMPORTANT: only gptq_gemm needs gptq_shuffle; marlin variants require the original format.
+            if weight_format == "gptq":
+                self._maybe_prepare_offline_gptq(x)
+                return {
+                    **meta,
+                    "gptq_qweight": self.gptq_qweight,
+                    "gptq_qzeros": self.gptq_qzeros,
+                    "gptq_scales": self.gptq_scales,
+                    "gptq_group_size": group_size,
+                    # Always pass g_idx (can be empty). vLLM expects it for GPTQ kernels.
+                    "gptq_g_idx": self.gptq_g_idx,
+                }
+
+            if weight_format == "gptq_marlin":
+                self._maybe_prepare_offline_gptq_marlin(x)
+                bits = self._infer_gptq_weight_bits(in_features=in_features)
+                return {
+                    **meta,
+                    "gptq_weight_bits": bits,
+                    "gptq_marlin_qweight": self.gptq_marlin_qweight,
+                    "gptq_marlin_scales": self.gptq_marlin_scales,
+                    "gptq_marlin_zp": self.gptq_marlin_zp,
+                    "gptq_marlin_g_idx": self.gptq_marlin_g_idx,
+                    "gptq_marlin_g_idx_sort_indices": self.gptq_marlin_g_idx_sort_indices,
+                    "gptq_marlin_workspace": self.gptq_marlin_workspace,
+                }
+
+            raise RuntimeError(
+                f"Offline GPTQ weights are present, but current strategy weight_format={weight_format!r} is not compatible."
+            )
+
+        if format_val == 2:  # AWQ
+            if weight_format == "awq":
+                return {
+                    **meta,
+                    "awq_qweight": self.awq_qweight,
+                    "awq_qzeros": self.awq_qzeros,
+                    "awq_scales": self.awq_scales,
+                    "awq_group_size": group_size,
+                }
+
+            if weight_format == "awq_marlin":
+                self._maybe_prepare_offline_awq_marlin(x)
+                return {
+                    **meta,
+                    "awq_marlin_qweight": self.awq_marlin_qweight,
+                    "awq_marlin_scales": self.awq_marlin_scales,
+                    "awq_marlin_zp": self.awq_marlin_zp,
+                    "awq_marlin_workspace": self.awq_marlin_workspace,
+                    "awq_weight_bits": 4,
+                }
+
+            raise RuntimeError(
+                f"Offline AWQ weights are present, but current strategy weight_format={weight_format!r} is not compatible."
+            )
+
+        raise RuntimeError(f"Unknown offline quant format: {format_val}")
+
+    def _forward_base(self, x: torch.Tensor, bias: Optional[torch.Tensor]) -> torch.Tensor:
+        """Unified forward dispatcher for bf16 / online quant / offline GPTQ/AWQ."""
+        strategy = self._get_linear_strategy()
+        # Runtime safety net: ensure we don't keep bf16+quant weights both resident.
+        self._maybe_promote_weight_to_quantized_at_runtime(x, strategy)
+
+        # Offline quantized weights (GPTQ/AWQ) have higher priority.
+        if self.has_offline_quantized_weight():
+            if strategy is None:
+                raise RuntimeError("Offline quantized weight is present but no linear strategy is configured.")
+            kwargs = self._build_offline_forward_kwargs(x, strategy)
+            return strategy.linear_forward(
+                x,
+                None,  # weight not used for offline quantized weights
+                bias,
+                quant_kind=self.quant_kind,
+                **kwargs,
+            )
+
+        if self.has_quantized_weight():
+            if strategy is None:
+                raise RuntimeError("Quantized weight is present but no linear strategy is configured.")
+            kwargs = {"quant_scales": self.quant_scales}
+            kwargs.update(self._maybe_int4_original_in_features_kwargs(strategy, x))
+            return strategy.linear_forward(
+                x,
+                self.quant_weight_int8,
+                bias,
+                quant_kind=self.quant_kind,
+                **kwargs,
+            )
+
+        if strategy is None:
+            weight = getattr(self, "weight", None)
+            if weight is None:
+                raise RuntimeError("No strategy is configured and bf16 weight is missing.")
+            return F.linear(x, weight, bias)
+
+        weight = getattr(self, "weight", None)
+        if weight is None:
+            raise RuntimeError("Strategy is configured but weight is missing (expected bf16 weight).")
+        kwargs = self._maybe_int4_original_in_features_kwargs(strategy, x)
+        return strategy.linear_forward(x, weight, bias, quant_kind=self.quant_kind, **kwargs)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
 
@@ -739,115 +896,7 @@ class ReplicatedLinear(LinearBase, LoRAMixin):
         self._maybe_quantize_loaded_weight_param(param, loaded_shard_id=None, expected_shard_ids={None})
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        strategy = get_linear_strategy(self.quant_kind)
-        # Runtime safety net: ensure we don't keep bf16+quant weights both resident.
-        self._maybe_promote_weight_to_quantized_at_runtime(x, strategy)
-        
-        # Check for offline quantized weights (GPTQ/AWQ) first
-        if self.has_offline_quantized_weight():
-            if strategy is None:
-                raise RuntimeError("Offline quantized weight is present but no linear strategy is configured.")
-            format_val = int(self._offline_quant_format.item())
-            out_features = int(self._offline_quant_out_features.item())
-            in_features = int(self._offline_quant_in_features.item())
-            group_size = int(self._offline_quant_group_size.item())
-            weight_format = getattr(strategy, "linear_weight_format", None)
-            
-            kwargs = {
-                "out_features": out_features,
-                "in_features": in_features,
-                "group_size": group_size,
-            }
-            
-            if format_val == 1:  # GPTQ
-                # IMPORTANT: only gptq_gemm needs gptq_shuffle; marlin variants require the original format.
-                if weight_format == "gptq":
-                    self._maybe_prepare_offline_gptq(x)
-                    kwargs.update({
-                        "gptq_qweight": self.gptq_qweight,
-                        "gptq_qzeros": self.gptq_qzeros,
-                        "gptq_scales": self.gptq_scales,
-                        "gptq_group_size": group_size,
-                    })
-                    # Always pass g_idx (can be empty). vLLM expects it for GPTQ kernels.
-                    kwargs["gptq_g_idx"] = self.gptq_g_idx
-                elif weight_format == "gptq_marlin":
-                    self._maybe_prepare_offline_gptq_marlin(x)
-                    # Expose bits (needed to select scalar_types.* in strategy).
-                    bits = int(self._offline_quant_bits.item()) if self._offline_quant_bits.numel() > 0 else 0
-                    if bits <= 0:
-                        pack_factor = in_features // int(self.gptq_qweight.shape[0])
-                        bits = 32 // pack_factor
-                    kwargs["gptq_weight_bits"] = bits
-                    kwargs.update({
-                        "gptq_marlin_qweight": self.gptq_marlin_qweight,
-                        "gptq_marlin_scales": self.gptq_marlin_scales,
-                        "gptq_marlin_zp": self.gptq_marlin_zp,
-                        "gptq_marlin_g_idx": self.gptq_marlin_g_idx,
-                        "gptq_marlin_g_idx_sort_indices": self.gptq_marlin_g_idx_sort_indices,
-                        "gptq_marlin_workspace": self.gptq_marlin_workspace,
-                    })
-                else:
-                    raise RuntimeError(
-                        f"Offline GPTQ weights are present, but current strategy weight_format={weight_format!r} "
-                        "is not compatible."
-                    )
-            elif format_val == 2:  # AWQ
-                if weight_format == "awq":
-                    kwargs.update({
-                        "awq_qweight": self.awq_qweight,
-                        "awq_qzeros": self.awq_qzeros,
-                        "awq_scales": self.awq_scales,
-                        "awq_group_size": group_size,
-                    })
-                elif weight_format == "awq_marlin":
-                    self._maybe_prepare_offline_awq_marlin(x)
-                    kwargs.update({
-                        "awq_marlin_qweight": self.awq_marlin_qweight,
-                        "awq_marlin_scales": self.awq_marlin_scales,
-                        "awq_marlin_zp": self.awq_marlin_zp,
-                        "awq_marlin_workspace": self.awq_marlin_workspace,
-                        "awq_weight_bits": 4,
-                    })
-                else:
-                    raise RuntimeError(
-                        f"Offline AWQ weights are present, but current strategy weight_format={weight_format!r} "
-                        "is not compatible."
-                    )
-            
-            base_out = strategy.linear_forward(
-                x,
-                None,  # weight not used for offline quantized weights
-                self.bias,
-                quant_kind=self.quant_kind,
-                **kwargs,
-            )
-        elif self.has_quantized_weight():
-            if strategy is None:
-                raise RuntimeError("Quantized weight is present but no linear strategy is configured.")
-            # For int4 (W4A16), we need to pass original_in_features
-            weight_format = getattr(strategy, "linear_weight_format", None)
-            kwargs = {"quant_scales": self.quant_scales}
-            if weight_format == "int4":
-                # For int4, packed weight shape is [out_features, (in_features + 1) // 2]
-                # We use x.shape[1] as the source of truth (it's the actual K dimension)
-                kwargs["original_in_features"] = x.shape[1]
-            base_out = strategy.linear_forward(
-                x,
-                self.quant_weight_int8,
-                self.bias,
-                quant_kind=self.quant_kind,
-                **kwargs,
-            )
-        elif strategy is None:
-            base_out = F.linear(x, self.weight, self.bias)
-        else:
-            # For int4 strategies (W4A16/W4A8), we need to pass original_in_features even when weight is not quantized yet
-            weight_format = getattr(strategy, "linear_weight_format", None)
-            kwargs = {}
-            if weight_format == "int4":
-                kwargs["original_in_features"] = x.shape[1]
-            base_out = strategy.linear_forward(x, self.weight, self.bias, quant_kind=self.quant_kind, **kwargs)
+        base_out = self._forward_base(x, self.bias)
         return self.lora_forward(x, base_out)
 
 
@@ -886,112 +935,7 @@ class ColumnParallelLinear(LinearBase, LoRAMixin):
         self._maybe_quantize_loaded_weight_param(param, loaded_shard_id=None, expected_shard_ids={None})
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        strategy = get_linear_strategy(self.quant_kind)
-        # Runtime safety net: ensure we don't keep bf16+quant weights both resident.
-        self._maybe_promote_weight_to_quantized_at_runtime(x, strategy)
-        
-        # Check for offline quantized weights (GPTQ/AWQ) first
-        if self.has_offline_quantized_weight():
-            if strategy is None:
-                raise RuntimeError("Offline quantized weight is present but no linear strategy is configured.")
-            format_val = int(self._offline_quant_format.item())
-            out_features = int(self._offline_quant_out_features.item())
-            in_features = int(self._offline_quant_in_features.item())
-            group_size = int(self._offline_quant_group_size.item())
-            weight_format = getattr(strategy, "linear_weight_format", None)
-            
-            kwargs = {
-                "out_features": out_features,
-                "in_features": in_features,
-                "group_size": group_size,
-            }
-            
-            if format_val == 1:  # GPTQ
-                if weight_format == "gptq":
-                    self._maybe_prepare_offline_gptq(x)
-                    kwargs.update({
-                        "gptq_qweight": self.gptq_qweight,
-                        "gptq_qzeros": self.gptq_qzeros,
-                        "gptq_scales": self.gptq_scales,
-                        "gptq_group_size": group_size,
-                    })
-                    kwargs["gptq_g_idx"] = self.gptq_g_idx
-                elif weight_format == "gptq_marlin":
-                    self._maybe_prepare_offline_gptq_marlin(x)
-                    bits = int(self._offline_quant_bits.item()) if self._offline_quant_bits.numel() > 0 else 0
-                    if bits <= 0:
-                        pack_factor = in_features // int(self.gptq_qweight.shape[0])
-                        bits = 32 // pack_factor
-                    kwargs["gptq_weight_bits"] = bits
-                    kwargs.update({
-                        "gptq_marlin_qweight": self.gptq_marlin_qweight,
-                        "gptq_marlin_scales": self.gptq_marlin_scales,
-                        "gptq_marlin_zp": self.gptq_marlin_zp,
-                        "gptq_marlin_g_idx": self.gptq_marlin_g_idx,
-                        "gptq_marlin_g_idx_sort_indices": self.gptq_marlin_g_idx_sort_indices,
-                        "gptq_marlin_workspace": self.gptq_marlin_workspace,
-                    })
-                else:
-                    raise RuntimeError(
-                        f"Offline GPTQ weights are present, but current strategy weight_format={weight_format!r} "
-                        "is not compatible."
-                    )
-            elif format_val == 2:  # AWQ
-                if weight_format == "awq":
-                    kwargs.update({
-                        "awq_qweight": self.awq_qweight,
-                        "awq_qzeros": self.awq_qzeros,
-                        "awq_scales": self.awq_scales,
-                        "awq_group_size": group_size,
-                    })
-                elif weight_format == "awq_marlin":
-                    self._maybe_prepare_offline_awq_marlin(x)
-                    kwargs.update({
-                        "awq_marlin_qweight": self.awq_marlin_qweight,
-                        "awq_marlin_scales": self.awq_marlin_scales,
-                        "awq_marlin_zp": self.awq_marlin_zp,
-                        "awq_marlin_workspace": self.awq_marlin_workspace,
-                        "awq_weight_bits": 4,
-                    })
-                else:
-                    raise RuntimeError(
-                        f"Offline AWQ weights are present, but current strategy weight_format={weight_format!r} "
-                        "is not compatible."
-                    )
-            
-            base_out = strategy.linear_forward(
-                x,
-                None,  # weight not used for offline quantized weights
-                self.bias,
-                quant_kind=self.quant_kind,
-                **kwargs,
-            )
-        elif self.has_quantized_weight():
-            if strategy is None:
-                raise RuntimeError("Quantized weight is present but no linear strategy is configured.")
-            # For int4 (W4A16), we need to pass original_in_features
-            weight_format = getattr(strategy, "linear_weight_format", None)
-            kwargs = {"quant_scales": self.quant_scales}
-            if weight_format == "int4":
-                # For int4, packed weight shape is [out_features, (in_features + 1) // 2]
-                # We use x.shape[1] as the source of truth (it's the actual K dimension)
-                kwargs["original_in_features"] = x.shape[1]
-            base_out = strategy.linear_forward(
-                x,
-                self.quant_weight_int8,
-                self.bias,
-                quant_kind=self.quant_kind,
-                **kwargs,
-            )
-        elif strategy is None:
-            base_out = F.linear(x, self.weight, self.bias)
-        else:
-            # For int4 strategies (W4A16/W4A8), we need to pass original_in_features even when weight is not quantized yet
-            weight_format = getattr(strategy, "linear_weight_format", None)
-            kwargs = {}
-            if weight_format == "int4":
-                kwargs["original_in_features"] = x.shape[1]
-            base_out = strategy.linear_forward(x, self.weight, self.bias, quant_kind=self.quant_kind, **kwargs)
+        base_out = self._forward_base(x, self.bias)
         return self.lora_forward(x, base_out)
 
 
@@ -1107,113 +1051,7 @@ class RowParallelLinear(LinearBase, LoRAMixin):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         bias = self.bias if self.tp_rank == 0 else None
-        strategy = get_linear_strategy(self.quant_kind)
-        # Runtime safety net: ensure we don't keep bf16+quant weights both resident.
-        self._maybe_promote_weight_to_quantized_at_runtime(x, strategy)
-        
-        # Check for offline quantized weights (GPTQ/AWQ) first
-        if self.has_offline_quantized_weight():
-            if strategy is None:
-                raise RuntimeError("Offline quantized weight is present but no linear strategy is configured.")
-            format_val = int(self._offline_quant_format.item())
-            out_features = int(self._offline_quant_out_features.item())
-            in_features = int(self._offline_quant_in_features.item())
-            group_size = int(self._offline_quant_group_size.item())
-            weight_format = getattr(strategy, "linear_weight_format", None)
-            
-            kwargs = {
-                "out_features": out_features,
-                "in_features": in_features,
-                "group_size": group_size,
-            }
-            
-            if format_val == 1:  # GPTQ
-                if weight_format == "gptq":
-                    # vLLM requires gptq_shuffle before first gptq_gemm.
-                    self._maybe_prepare_offline_gptq(x)
-                    kwargs.update({
-                        "gptq_qweight": self.gptq_qweight,
-                        "gptq_qzeros": self.gptq_qzeros,
-                        "gptq_scales": self.gptq_scales,
-                        "gptq_group_size": group_size,
-                    })
-                    # Always pass g_idx (can be empty); strategy will normalize dtype/device.
-                    kwargs["gptq_g_idx"] = self.gptq_g_idx
-                elif weight_format == "gptq_marlin":
-                    self._maybe_prepare_offline_gptq_marlin(x)
-                    bits = int(self._offline_quant_bits.item()) if self._offline_quant_bits.numel() > 0 else 0
-                    if bits <= 0:
-                        pack_factor = in_features // int(self.gptq_qweight.shape[0])
-                        bits = 32 // pack_factor
-                    kwargs["gptq_weight_bits"] = bits
-                    kwargs.update({
-                        "gptq_marlin_qweight": self.gptq_marlin_qweight,
-                        "gptq_marlin_scales": self.gptq_marlin_scales,
-                        "gptq_marlin_zp": self.gptq_marlin_zp,
-                        "gptq_marlin_g_idx": self.gptq_marlin_g_idx,
-                        "gptq_marlin_g_idx_sort_indices": self.gptq_marlin_g_idx_sort_indices,
-                        "gptq_marlin_workspace": self.gptq_marlin_workspace,
-                    })
-                else:
-                    raise RuntimeError(
-                        f"Offline GPTQ weights are present, but current strategy weight_format={weight_format!r} "
-                        "is not compatible."
-                    )
-            elif format_val == 2:  # AWQ
-                if weight_format == "awq":
-                    kwargs.update({
-                        "awq_qweight": self.awq_qweight,
-                        "awq_qzeros": self.awq_qzeros,
-                        "awq_scales": self.awq_scales,
-                        "awq_group_size": group_size,
-                    })
-                elif weight_format == "awq_marlin":
-                    self._maybe_prepare_offline_awq_marlin(x)
-                    kwargs.update({
-                        "awq_marlin_qweight": self.awq_marlin_qweight,
-                        "awq_marlin_scales": self.awq_marlin_scales,
-                        "awq_marlin_zp": self.awq_marlin_zp,
-                        "awq_marlin_workspace": self.awq_marlin_workspace,
-                        "awq_weight_bits": 4,
-                    })
-                else:
-                    raise RuntimeError(
-                        f"Offline AWQ weights are present, but current strategy weight_format={weight_format!r} "
-                        "is not compatible."
-                    )
-            
-            y = strategy.linear_forward(
-                x,
-                None,  # weight not used for offline quantized weights
-                bias,
-                quant_kind=self.quant_kind,
-                **kwargs,
-            )
-        elif self.has_quantized_weight():
-            if strategy is None:
-                raise RuntimeError("Quantized weight is present but no linear strategy is configured.")
-            # For int4 (W4A16), we must pass original_in_features to disambiguate packed K.
-            weight_format = getattr(strategy, "linear_weight_format", None)
-            kwargs = {"quant_scales": self.quant_scales}
-            if weight_format == "int4":
-                # Use activation K as the source of truth (it's the actual K dimension).
-                kwargs["original_in_features"] = x.shape[1]
-            y = strategy.linear_forward(
-                x,
-                self.quant_weight_int8,
-                bias,
-                quant_kind=self.quant_kind,
-                **kwargs,
-            )
-        elif strategy is None:
-            y = F.linear(x, self.weight, bias)
-        else:
-            # For int4 strategies (W4A16/W4A8), we need to pass original_in_features even when weight is not quantized yet
-            weight_format = getattr(strategy, "linear_weight_format", None)
-            kwargs = {}
-            if weight_format == "int4":
-                kwargs["original_in_features"] = x.shape[1]
-            y = strategy.linear_forward(x, self.weight, bias, quant_kind=self.quant_kind, **kwargs)
+        y = self._forward_base(x, bias)
         if self.tp_size > 1:
             dist.all_reduce(y)
         return self.lora_forward(x, y)

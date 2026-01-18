@@ -89,6 +89,24 @@ class LinearInt4W4A16Strategy(LinearQuantizationStrategy):
         packed = self._pack_int4_to_int8(q)
         return packed, {"scales": scales}
 
+    def quantize_weight_for_kernel(
+        self,
+        weight: torch.Tensor,
+        *,
+        device: torch.device | None = None,
+        **_: Any,
+    ) -> tuple[torch.Tensor, Any]:
+        """Quantize+pack bf16 weight for kernel consumption.
+
+        Returns:
+            (packed_int8 [N, ceil(K/2)], scales_fp32 [N])
+        """
+        packed, meta = self.quantize(weight)
+        if device is not None:
+            packed = packed.to(device=device)
+            meta["scales"] = meta["scales"].to(device=device)
+        return packed, meta["scales"]
+
     def dequantize(self, quantized: torch.Tensor, scale_or_metadata: Any, **kwargs: Any) -> torch.Tensor:
         original_k = int(kwargs.get("original_in_features", 0))
         if original_k <= 0:

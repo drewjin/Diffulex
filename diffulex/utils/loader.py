@@ -226,38 +226,78 @@ def _load_gptq_awq_weights(model: nn.Module, config: Config):
     if not (use_gptq or use_awq):
         return loaded_gptq, loaded_awq, skipped
     
-    # Collect all weight names from safetensors files
-    all_keys = []
     all_files = list(glob(os.path.join(config.model, "*.safetensors")))
+
+    # Scan keys once and remember which file contains each key.
+    # This avoids the O(num_modules * num_files) "search every file for every module" pattern below.
+    key_to_file: dict[str, str] = {}
+    module_keys: dict[str, dict[str, str]] = {}
+    offline_suffixes = (".qweight", ".qzeros", ".scales", ".g_idx")
     for file in all_files:
         with safe_open(file, "pt", "cpu") as f:
-            all_keys.extend(f.keys())
+            for key in f.keys():
+                if not key.endswith(offline_suffixes):
+                    continue
+                key_to_file[key] = file
+                # Group by module prefix: {prefix}.qweight, {prefix}.qzeros, {prefix}.scales, {prefix}.g_idx (GPTQ only)
+                if key.endswith(".qweight"):
+                    prefix = key[:-8]
+                    module_keys.setdefault(prefix, {})["qweight"] = key
+                elif key.endswith(".qzeros"):
+                    prefix = key[:-7]
+                    module_keys.setdefault(prefix, {})["qzeros"] = key
+                elif key.endswith(".scales"):
+                    prefix = key[:-7]
+                    module_keys.setdefault(prefix, {})["scales"] = key
+                else:  # .g_idx
+                    prefix = key[:-6]
+                    module_keys.setdefault(prefix, {})["g_idx"] = key
+
+    # Cache modules lookup to avoid rebuilding dict(model.named_modules()) repeatedly.
+    named_modules = dict(model.named_modules())
+    offline_capable_modules: dict[str, nn.Module] = {
+        name: m for name, m in named_modules.items() if hasattr(m, "set_offline_quantized_weight")
+    }
     
-    # Group keys by module prefix
-    module_keys: dict[str, dict[str, str]] = {}
-    for key in all_keys:
-        # Check for GPTQ/AWQ keys: {prefix}.qweight, {prefix}.qzeros, {prefix}.scales, {prefix}.g_idx (GPTQ only)
-        if key.endswith(".qweight"):
-            prefix = key[:-8]  # Remove ".qweight"
-            if prefix not in module_keys:
-                module_keys[prefix] = {}
-            module_keys[prefix]["qweight"] = key
-        elif key.endswith(".qzeros"):
-            prefix = key[:-7]  # Remove ".qzeros"
-            if prefix not in module_keys:
-                module_keys[prefix] = {}
-            module_keys[prefix]["qzeros"] = key
-        elif key.endswith(".scales"):
-            prefix = key[:-7]  # Remove ".scales"
-            if prefix not in module_keys:
-                module_keys[prefix] = {}
-            module_keys[prefix]["scales"] = key
-        elif key.endswith(".g_idx"):
-            prefix = key[:-6]  # Remove ".g_idx"
-            if prefix not in module_keys:
-                module_keys[prefix] = {}
-            module_keys[prefix]["g_idx"] = key
-    
+    def _find_offline_capable_module(module_name: str) -> nn.Module | None:
+        """Best-effort resolve module_name to a module with offline quant support."""
+        m = offline_capable_modules.get(module_name)
+        if m is not None:
+            return m
+
+        # Try a few naming fallbacks (keep behavior compatible with the previous implementation).
+        leaf = module_name.split(".")[-1] if module_name else module_name
+        for name, cand in offline_capable_modules.items():
+            if (
+                name == module_name
+                or name.endswith("." + module_name)
+                or module_name.endswith("." + name)
+                or (name.split(".")[-1] == leaf)
+            ):
+                return cand
+        return None
+
+    def _load_tensors_for_prefix(key_dict: dict[str, str], *, want_g_idx: bool) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+        """Load qweight/qzeros/scales/(g_idx) from the minimal set of safetensors files."""
+        qweight = qzeros = scales = g_idx = None
+        keys = [key_dict.get("qweight"), key_dict.get("qzeros"), key_dict.get("scales")]
+        if want_g_idx:
+            keys.append(key_dict.get("g_idx"))
+        files_needed = {key_to_file.get(k) for k in keys if k}
+        files_needed.discard(None)
+
+        for file in files_needed:
+            with safe_open(file, "pt", "cpu") as f:
+                if qweight is None and (key_dict.get("qweight") in f.keys()):
+                    qweight = f.get_tensor(key_dict["qweight"])
+                if qzeros is None and (key_dict.get("qzeros") in f.keys()):
+                    qzeros = f.get_tensor(key_dict["qzeros"])
+                if scales is None and (key_dict.get("scales") in f.keys()):
+                    scales = f.get_tensor(key_dict["scales"])
+                if want_g_idx and g_idx is None and ("g_idx" in key_dict) and (key_dict["g_idx"] in f.keys()):
+                    g_idx = f.get_tensor(key_dict["g_idx"])
+        return qweight, qzeros, scales, g_idx
+
     # Load GPTQ/AWQ weights for each module
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
     
@@ -272,31 +312,8 @@ def _load_gptq_awq_weights(model: nn.Module, config: Config):
                 module_name = prefix.replace(k, v)
                 break
         
-        # Try to find the module
         try:
-            module = None
-            # Try exact match first
-            try:
-                module = dict(model.named_modules())[module_name]
-                if not hasattr(module, "set_offline_quantized_weight"):
-                    module = None
-            except KeyError:
-                pass
-            
-            # Try partial match if exact match failed
-            if module is None:
-                for name, m in model.named_modules():
-                    # Handle different naming conventions
-                    if (
-                        name == module_name
-                        or name.endswith("." + module_name)
-                        or module_name.endswith("." + name)
-                        or (name.split(".")[-1] == module_name.split(".")[-1])
-                    ):
-                        if hasattr(m, "set_offline_quantized_weight"):
-                            module = m
-                            break
-            
+            module = _find_offline_capable_module(module_name)
             if module is None:
                 skipped += 1
                 continue
@@ -316,27 +333,10 @@ def _load_gptq_awq_weights(model: nn.Module, config: Config):
                 skipped += 1
                 continue
             
-            # Load tensors from safetensors files
-            qweight = None
-            qzeros = None
-            scales = None
-            g_idx = None
-            
-            for file in all_files:
-                with safe_open(file, "pt", "cpu") as f:
-                    if key_dict["qweight"] in f.keys() and qweight is None:
-                        qweight = f.get_tensor(key_dict["qweight"])
-                    if key_dict["qzeros"] in f.keys() and qzeros is None:
-                        qzeros = f.get_tensor(key_dict["qzeros"])
-                    if key_dict["scales"] in f.keys() and scales is None:
-                        scales = f.get_tensor(key_dict["scales"])
-                    if format == "gptq" and "g_idx" in key_dict and key_dict["g_idx"] in f.keys() and g_idx is None:
-                        g_idx = f.get_tensor(key_dict["g_idx"])
-                
-                # Early exit if all required tensors are loaded
-                if qweight is not None and qzeros is not None and scales is not None:
-                    if format != "gptq" or g_idx is not None:
-                        break
+            # Load tensors from the minimal set of safetensors files.
+            qweight, qzeros, scales, g_idx = _load_tensors_for_prefix(
+                key_dict, want_g_idx=(format == "gptq")
+            )
             
             if qweight is None or qzeros is None or scales is None:
                 skipped += 1
@@ -352,8 +352,8 @@ def _load_gptq_awq_weights(model: nn.Module, config: Config):
                     out_features = int(scales.shape[1]) if scales.ndim == 2 else int(qweight.shape[1])
                     in_features = int(qweight.shape[0]) * 16
                     if ckpt_bits not in (4, 8):
-                        print(
-                            f"Warning: gptq_marlin requires bits=4/8, got bits={ckpt_bits} for {module_name}. Skipping."
+                        logger.warning(
+                            f"gptq_marlin requires bits=4/8, got bits={ckpt_bits} for {module_name}. Skipping."
                         )
                         skipped += 1
                         continue
@@ -365,17 +365,17 @@ def _load_gptq_awq_weights(model: nn.Module, config: Config):
                     # qzeros: [K/group, N/pack] (may be empty for some checkpoints)
                     if getattr(qzeros, "numel", lambda: 1)() == 0:
                         if ckpt_bits not in (2, 4, 8):
-                            print(
-                                f"Warning: qzeros is empty and cannot infer bits for {module_name}. "
-                                f"Please ensure quantize_config.json contains bits (2/4/8). Skipping."
+                            logger.warning(
+                                f"qzeros is empty and cannot infer bits for {module_name}. "
+                                "Please ensure quantize_config.json contains bits (2/4/8). Skipping."
                             )
                             skipped += 1
                             continue
                         pack_factor = 32 // int(ckpt_bits)
                     else:
                         if int(qzeros.shape[1]) <= 0 or out_features % int(qzeros.shape[1]) != 0:
-                            print(
-                                f"Warning: Cannot infer GPTQ pack_factor from qzeros for {module_name}: "
+                            logger.warning(
+                                f"Cannot infer GPTQ pack_factor from qzeros for {module_name}: "
                                 f"qzeros.shape={tuple(qzeros.shape)}, qweight.shape={tuple(qweight.shape)}. Skipping."
                             )
                             skipped += 1
@@ -386,8 +386,8 @@ def _load_gptq_awq_weights(model: nn.Module, config: Config):
                 # awq: qweight: [K, N/pack], scales: [K/group, N]
                 out_features = int(scales.shape[1]) if scales.ndim == 2 else int(qweight.shape[1])
                 if int(qweight.shape[1]) <= 0 or out_features % int(qweight.shape[1]) != 0:
-                    print(
-                        f"Warning: Cannot infer AWQ pack_factor from scales/qweight for {module_name}: "
+                    logger.warning(
+                        f"Cannot infer AWQ pack_factor from scales/qweight for {module_name}: "
                         f"scales.shape={tuple(scales.shape)}, qweight.shape={tuple(qweight.shape)}. Skipping."
                     )
                     skipped += 1
@@ -428,9 +428,8 @@ def _load_gptq_awq_weights(model: nn.Module, config: Config):
             ):
                 group_size_norm = in_features if group_size == -1 else group_size
                 if group_size_norm <= 0 or (in_features % group_size_norm) != 0:
-                    print(
-                        f"Warning: Invalid group_size={group_size} for {module_name} with in_features={in_features}. "
-                        "Skipping."
+                    logger.warning(
+                        f"Invalid group_size={group_size} for {module_name} with in_features={in_features}. Skipping."
                     )
                     skipped += 1
                     continue
@@ -443,7 +442,7 @@ def _load_gptq_awq_weights(model: nn.Module, config: Config):
                         device=qweight.device,
                     )
                 except Exception as e:
-                    print(f"Warning: Failed to create dummy qzeros for {module_name}: {e}. Skipping.")
+                    logger.warning(f"Failed to create dummy qzeros for {module_name}: {e}. Skipping.")
                     skipped += 1
                     continue
             
@@ -455,9 +454,8 @@ def _load_gptq_awq_weights(model: nn.Module, config: Config):
             tp_dim = getattr(module, "tp_dim", None)
             if tp_size > 1:
                 if tp_dim not in (0, 1):
-                    print(
-                        f"Warning: Unsupported tp_dim={tp_dim} for offline quantized weights. "
-                        f"Skipping {module_name}."
+                    logger.warning(
+                        f"Unsupported tp_dim={tp_dim} for offline quantized weights. Skipping {module_name}."
                     )
                     skipped += 1
                     continue
@@ -465,8 +463,8 @@ def _load_gptq_awq_weights(model: nn.Module, config: Config):
                 # Shard along output features (N) for column-parallel modules.
                 if tp_dim == 0:
                     if out_features % tp_size != 0:
-                        print(
-                            f"Warning: out_features={out_features} not divisible by TP={tp_size} for {module_name}. "
+                        logger.warning(
+                            f"out_features={out_features} not divisible by TP={tp_size} for {module_name}. "
                             "Skipping offline quant weights for this module."
                         )
                         skipped += 1
@@ -475,8 +473,8 @@ def _load_gptq_awq_weights(model: nn.Module, config: Config):
                     out_start = tp_rank * out_per
                     out_end = out_start + out_per
                     if out_per % pack_factor != 0:
-                        print(
-                            f"Warning: out_features_per_partition={out_per} not divisible by pack_factor={pack_factor} "
+                        logger.warning(
+                            f"out_features_per_partition={out_per} not divisible by pack_factor={pack_factor} "
                             f"for {module_name}. Skipping."
                         )
                         skipped += 1
@@ -490,7 +488,9 @@ def _load_gptq_awq_weights(model: nn.Module, config: Config):
                             # Marlin qweight packs N by a factor (bits/2): N_packed = N * (bits/2)
                             n_factor = int(ckpt_bits) // 2
                             if n_factor <= 0:
-                                print(f"Warning: invalid gptq_marlin n_factor for bits={ckpt_bits} ({module_name}). Skipping.")
+                                logger.warning(
+                                    f"invalid gptq_marlin n_factor for bits={ckpt_bits} ({module_name}). Skipping."
+                                )
                                 skipped += 1
                                 continue
                             qweight = qweight[:, (out_start * n_factor):(out_end * n_factor)]
@@ -516,8 +516,8 @@ def _load_gptq_awq_weights(model: nn.Module, config: Config):
                 # Shard along input features (K) for row-parallel modules.
                 elif tp_dim == 1:
                     if in_features % tp_size != 0:
-                        print(
-                            f"Warning: in_features={in_features} not divisible by TP={tp_size} for {module_name}. "
+                        logger.warning(
+                            f"in_features={in_features} not divisible by TP={tp_size} for {module_name}. "
                             "Skipping offline quant weights for this module."
                         )
                         skipped += 1
@@ -526,8 +526,8 @@ def _load_gptq_awq_weights(model: nn.Module, config: Config):
                     in_start = tp_rank * in_per
                     in_end = in_start + in_per
                     if group_size <= 0 or (in_per % group_size) != 0 or (in_start % group_size) != 0:
-                        print(
-                            f"Warning: group_size={group_size} incompatible with TP sharding for {module_name} "
+                        logger.warning(
+                            f"group_size={group_size} incompatible with TP sharding for {module_name} "
                             f"(in_per={in_per}, in_start={in_start}). Skipping."
                         )
                         skipped += 1
@@ -539,8 +539,8 @@ def _load_gptq_awq_weights(model: nn.Module, config: Config):
                         if is_gptq_marlin_ckpt:
                             # Marlin qweight packs K in tiles of 16: K_packed = K / 16
                             if in_start % 16 != 0:
-                                print(
-                                    f"Warning: gptq_marlin requires in_start divisible by 16, got in_start={in_start} "
+                                logger.warning(
+                                    f"gptq_marlin requires in_start divisible by 16, got in_start={in_start} "
                                     f"for {module_name}. Skipping."
                                 )
                                 skipped += 1
@@ -553,8 +553,8 @@ def _load_gptq_awq_weights(model: nn.Module, config: Config):
                             group_size_norm = in_features if group_size == -1 else group_size
                             expected_num_groups = in_features // group_size_norm if group_size_norm > 0 else 0
                             if expected_num_groups <= 0:
-                                print(
-                                    f"Warning: invalid expected_num_groups={expected_num_groups} for {module_name}. Skipping."
+                                logger.warning(
+                                    f"invalid expected_num_groups={expected_num_groups} for {module_name}. Skipping."
                                 )
                                 skipped += 1
                                 continue
@@ -564,8 +564,8 @@ def _load_gptq_awq_weights(model: nn.Module, config: Config):
                                 # Legacy/alternate layout: [2*num_groups, N/2]
                                 scales = scales[(2 * g_start):(2 * g_end), :]
                             else:
-                                print(
-                                    f"Warning: unexpected gptq_marlin scales.shape[0]={int(scales.shape[0])} "
+                                logger.warning(
+                                    f"unexpected gptq_marlin scales.shape[0]={int(scales.shape[0])} "
                                     f"(expected {expected_num_groups} or {2*expected_num_groups}) for {module_name}. Skipping."
                                 )
                                 skipped += 1
@@ -576,8 +576,8 @@ def _load_gptq_awq_weights(model: nn.Module, config: Config):
                         else:
                             # qweight: [K/pack, N] (packed on K)
                             if in_start % pack_factor != 0:
-                                print(
-                                    f"Warning: in_start={in_start} not divisible by pack_factor={pack_factor} "
+                                logger.warning(
+                                    f"in_start={in_start} not divisible by pack_factor={pack_factor} "
                                     f"for {module_name}. Skipping."
                                 )
                                 skipped += 1
@@ -632,15 +632,11 @@ def _load_gptq_awq_weights(model: nn.Module, config: Config):
                 else:
                     loaded_awq += 1
             except Exception as e:
-                print(f"Failed to load offline quantized weights for {module_name}: {e}")
-                import traceback
-                traceback.print_exc()
+                logger.exception(f"Failed to load offline quantized weights for {module_name}: {e}")
                 skipped += 1
         
         except Exception as e:
-            print(f"Error loading offline quantized weights for {prefix}: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.exception(f"Error loading offline quantized weights for {prefix}: {e}")
             skipped += 1
     
     return loaded_gptq, loaded_awq, skipped
