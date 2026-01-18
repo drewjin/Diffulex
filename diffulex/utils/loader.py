@@ -403,10 +403,14 @@ def _load_gptq_awq_weights(model: nn.Module, config: Config):
                 group_size = int(ckpt_group_size)
             else:
                 if is_gptq_marlin_ckpt and len(scales.shape) == 2 and int(scales.shape[0]) > 0:
-                    # marlin scales often use first dim = 2 * num_groups
-                    num_groups = int(scales.shape[0]) // 2
+                    # vLLM marlin_permute_scales keeps shape [num_groups, N] for most cases.
+                    # Some older/alternate layouts may use [2*num_groups, N/2].
+                    num_groups = int(scales.shape[0])
                     if num_groups > 0 and in_features % num_groups == 0:
                         group_size = in_features // num_groups
+                    elif num_groups % 2 == 0 and (in_features % (num_groups // 2)) == 0:
+                        # Fallback for legacy 2*num_groups layouts.
+                        group_size = in_features // (num_groups // 2)
                 else:
                     num_groups = int(qzeros.shape[0]) if getattr(qzeros, "numel", lambda: 1)() > 0 else 0
                     if num_groups > 0 and in_features % num_groups == 0:
@@ -544,8 +548,28 @@ def _load_gptq_awq_weights(model: nn.Module, config: Config):
                             q_start = in_start // 16
                             q_end = in_end // 16
                             qweight = qweight[q_start:q_end, :]
-                            # scales first dim is typically 2*num_groups
-                            scales = scales[(2 * g_start):(2 * g_end), :]
+                            # Shard scales on group dimension (K/group).
+                            # vLLM marlin_permute_scales typically returns [num_groups, N].
+                            group_size_norm = in_features if group_size == -1 else group_size
+                            expected_num_groups = in_features // group_size_norm if group_size_norm > 0 else 0
+                            if expected_num_groups <= 0:
+                                print(
+                                    f"Warning: invalid expected_num_groups={expected_num_groups} for {module_name}. Skipping."
+                                )
+                                skipped += 1
+                                continue
+                            if int(scales.shape[0]) == expected_num_groups:
+                                scales = scales[g_start:g_end, :]
+                            elif int(scales.shape[0]) == 2 * expected_num_groups:
+                                # Legacy/alternate layout: [2*num_groups, N/2]
+                                scales = scales[(2 * g_start):(2 * g_end), :]
+                            else:
+                                print(
+                                    f"Warning: unexpected gptq_marlin scales.shape[0]={int(scales.shape[0])} "
+                                    f"(expected {expected_num_groups} or {2*expected_num_groups}) for {module_name}. Skipping."
+                                )
+                                skipped += 1
+                                continue
                             if g_idx is not None and getattr(g_idx, "numel", lambda: 1)() > 0:
                                 g_idx = g_idx[in_start:in_end]
                             in_features = in_per

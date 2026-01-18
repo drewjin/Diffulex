@@ -112,8 +112,8 @@ class LinearGPTQMarlinW4A16Strategy(LinearQuantizationStrategy):
         else:
             raise RuntimeError(f"gptq_marlin: unsupported weight_bits={weight_bits} (expected 4 or 8)")
 
-        # vLLM marlin kernels expect FP16 activations.
-        x_in = x.to(dtype=torch.float16) if x.dtype != torch.float16 else x
+        # Align with vLLM Marlin: accept bf16/fp16 activations directly.
+        x_in = x
 
         # g_idx can be empty (desc_act=False). Ensure correct dtype/device.
         if g_idx is None or (isinstance(g_idx, torch.Tensor) and g_idx.numel() == 0):
@@ -152,5 +152,5 @@ class LinearGPTQMarlinW4A16Strategy(LinearQuantizationStrategy):
             bias=marlin_bias,
             input_dtype=None,
         )
-        return out.to(dtype=x.dtype) if out.dtype != x.dtype else out
+        return out
 
