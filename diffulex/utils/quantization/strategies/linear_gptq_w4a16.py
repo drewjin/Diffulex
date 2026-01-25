@@ -34,6 +34,10 @@ def _build_linear_gptq_w4a16() -> LinearQuantizationStrategy:
 
 
 class LinearGPTQW4A16Strategy(LinearQuantizationStrategy):
+    def __init__(self) -> None:
+        super().__init__()
+        self._ops_available: bool = bool(ops is not None and hasattr(torch.ops, "_C") and hasattr(torch.ops._C, "gptq_gemm"))
+
     @property
     def name(self) -> str:
         return "linear_gptq_w4a16"
@@ -77,57 +81,82 @@ class LinearGPTQW4A16Strategy(LinearQuantizationStrategy):
     def linear_forward(
         self,
         x: torch.Tensor,
-        weight: torch.Tensor,
+        weight: Optional[torch.Tensor],
         bias: Optional[torch.Tensor],
         *,
         quant_kind: str,
-        **kwargs: Any,
+        gptq_qweight: Optional[torch.Tensor] = None,
+        gptq_qzeros: Optional[torch.Tensor] = None,
+        gptq_scales: Optional[torch.Tensor] = None,
+        gptq_g_idx: Optional[torch.Tensor] = None,
+        weight_bits: int = 0,
+        use_v2_format: bool = False,
+        out_features: Optional[int] = None,
+        in_features: Optional[int] = None,
+        group_size: int = 128,
     ) -> torch.Tensor:
-        _ = quant_kind, weight
-        if ops is None:
+        _ = quant_kind, weight, in_features, group_size
+        if not self._ops_available:
             raise RuntimeError(
                 "vLLM is required for GPTQ W4A16 (missing `vllm._custom_ops`). "
                 "Please install/build vLLM with CUDA ops."
             )
-
-        qweight = kwargs.get("gptq_qweight", None)
-        qzeros = kwargs.get("gptq_qzeros", None)
-        scales = kwargs.get("gptq_scales", None)
-        g_idx = kwargs.get("gptq_g_idx", None)
+        qweight = gptq_qweight
+        qzeros = gptq_qzeros
+        scales = gptq_scales
+        g_idx = gptq_g_idx
 
         if qweight is None or qzeros is None or scales is None:
+            # correctness fallback (should not happen for offline GPTQ weights)
+            if weight is None:
+                raise RuntimeError("GPTQ offline weights missing packed tensors and bf16 weight is not present.")
             return F.linear(x, weight, bias)
 
-        use_v2_format = bool(kwargs.get("gptq_use_v2_format", False))
-
-        # Infer weight_bits from packed shapes to support GPTQ W2/W4/W8.
-        # qzeros: [K/group, N/pack_factor] and qweight: [K/pack_factor, N]
-        if qzeros.shape[1] <= 0 or qweight.shape[1] % int(qzeros.shape[1]) != 0:
-            raise RuntimeError(
-                f"Invalid GPTQ packed shapes: qweight.shape={tuple(qweight.shape)}, "
-                f"qzeros.shape={tuple(qzeros.shape)}"
-            )
-        pack_factor = int(qweight.shape[1]) // int(qzeros.shape[1])
-        if 32 % pack_factor != 0:
-            raise RuntimeError(
-                f"Unsupported GPTQ pack_factor={pack_factor} (requires 32%pack_factor==0). "
-                f"qweight.shape={tuple(qweight.shape)}, qzeros.shape={tuple(qzeros.shape)}"
-            )
-        weight_bits = 32 // pack_factor
-
         # vLLM GPTQ kernels expect FP16 activations.
-        x_in = x.to(dtype=torch.float16) if x.dtype != torch.float16 else x
-        qweight = qweight.to(device=x.device, dtype=torch.int32)
-        qzeros = qzeros.to(device=x.device, dtype=torch.int32)
-        scales = scales.to(device=x.device, dtype=torch.float16)
+        x_in = x if x.dtype == torch.float16 else x.to(dtype=torch.float16)
 
+        # ---- Fast path ----
+        if (
+            x_in.dim() == 2
+            and x_in.is_contiguous()
+            and qweight.device == x.device
+            and qzeros.device == x.device
+            and scales.device == x.device
+            and qweight.dtype == torch.int32
+            and qzeros.dtype == torch.int32
+            and scales.dtype == torch.float16
+            and qweight.is_contiguous()
+            and qzeros.is_contiguous()
+            and scales.is_contiguous()
+            and weight_bits > 0
+        ):
+            if g_idx is None or (isinstance(g_idx, torch.Tensor) and g_idx.numel() == 0):
+                g_idx_t = torch.empty((0,), device=x.device, dtype=torch.int)
+            else:
+                # Prefer already-correct dtype/device to avoid per-call copies.
+                g_idx_t = g_idx if (g_idx.device == x.device and g_idx.dtype == torch.int) else g_idx.to(device=x.device, dtype=torch.int)
+            n = int(out_features) if out_features is not None else int(qweight.shape[-1])
+            output = torch.ops._C.gptq_gemm(
+                x_in,
+                qweight,
+                qzeros,
+                scales,
+                g_idx_t,
+                True,
+                bool(use_v2_format),
+                int(weight_bits),
+            )
+            if bias is not None:
+                output.add_(bias.to(dtype=output.dtype))
+            # Output is [M,N]
+            return output.to(dtype=x.dtype) if output.dtype != x.dtype else output
+
+        out_shape = x.shape[:-1] + (int(out_features) if out_features is not None else int(qweight.shape[-1]),)
+        reshaped_x = x_in.reshape(-1, x_in.shape[-1])
         if g_idx is None or (isinstance(g_idx, torch.Tensor) and g_idx.numel() == 0):
             g_idx_t = torch.empty((0,), device=x.device, dtype=torch.int)
         else:
             g_idx_t = g_idx.to(device=x.device, dtype=torch.int)
-
-        out_shape = x.shape[:-1] + (qweight.shape[-1],)
-        reshaped_x = x_in.reshape(-1, x_in.shape[-1])
 
         output = ops.gptq_gemm(
             reshaped_x,
@@ -135,9 +164,9 @@ class LinearGPTQW4A16Strategy(LinearQuantizationStrategy):
             qzeros,
             scales,
             g_idx_t,
-            True,  # use_exllama (vLLM shuffles weights into exllama-friendly layout)
-            use_v2_format,
-            weight_bits,
+            True,  # use_exllama
+            bool(use_v2_format),
+            int(weight_bits) if weight_bits > 0 else 4,
         )
         if bias is not None:
             output.add_(bias.to(dtype=output.dtype))

@@ -30,6 +30,10 @@ def _build_linear_awq_w4a16() -> LinearQuantizationStrategy:
 
 
 class LinearAWQW4A16Strategy(LinearQuantizationStrategy):
+    def __init__(self) -> None:
+        super().__init__()
+        self._ops_available: bool = bool(ops is not None and hasattr(torch.ops, "_C") and hasattr(torch.ops._C, "awq_gemm"))
+
     @property
     def name(self) -> str:
         return "linear_awq_w4a16"
@@ -73,47 +77,47 @@ class LinearAWQW4A16Strategy(LinearQuantizationStrategy):
     def linear_forward(
         self,
         x: torch.Tensor,
-        weight: torch.Tensor,
+        weight: Optional[torch.Tensor],
         bias: Optional[torch.Tensor],
         *,
         quant_kind: str,
-        **kwargs: Any,
+        awq_qweight: Optional[torch.Tensor] = None,
+        awq_qzeros: Optional[torch.Tensor] = None,
+        awq_scales: Optional[torch.Tensor] = None,
+        pack_factor: int = 8,
+        out_features: Optional[int] = None,
+        in_features: Optional[int] = None,
+        group_size: int = 128,
     ) -> torch.Tensor:
-        _ = quant_kind, weight
-        if ops is None:
+        _ = quant_kind, weight, pack_factor, in_features, group_size
+        if not self._ops_available:
             raise RuntimeError(
                 "vLLM is required for AWQ W4A16 (missing `vllm._custom_ops`). "
                 "Please install/build vLLM with CUDA ops."
             )
-
-        qweight = kwargs.get("awq_qweight", None)
-        qzeros = kwargs.get("awq_qzeros", None)
-        scales = kwargs.get("awq_scales", None)
-
+        qweight = awq_qweight
+        qzeros = awq_qzeros
+        scales = awq_scales
         if qweight is None or qzeros is None or scales is None:
+            if weight is None:
+                raise RuntimeError("AWQ offline weights missing packed tensors and bf16 weight is not present.")
             return F.linear(x, weight, bias)
 
-        # Infer pack_factor from packed shapes to avoid hard-coding 4-bit.
-        # AWQ: qweight [K, N/pack], scales [K/group, N]
-        if scales.ndim != 2 or scales.shape[1] <= 0:
-            raise RuntimeError(f"Invalid AWQ scales shape: {tuple(scales.shape)}")
-        if qweight.shape[1] <= 0 or int(scales.shape[1]) % int(qweight.shape[1]) != 0:
-            raise RuntimeError(
-                f"Invalid AWQ packed shapes: qweight.shape={tuple(qweight.shape)}, "
-                f"scales.shape={tuple(scales.shape)}"
-            )
-        pack_factor = int(scales.shape[1]) // int(qweight.shape[1])
         # vLLM AWQ kernels expect FP16 activations.
-        x_in = x.to(dtype=torch.float16) if x.dtype != torch.float16 else x
-        qweight = qweight.to(device=x.device, dtype=torch.int32)
-        qzeros = qzeros.to(device=x.device, dtype=torch.int32)
-        scales = scales.to(device=x.device, dtype=torch.float16)
+        x_in = x if x.dtype == torch.float16 else x.to(dtype=torch.float16)
 
-        out_shape = x.shape[:-1] + (qweight.shape[-1] * pack_factor,)
+        # Use known out_features if provided (avoid per-call inference).
+        n = int(out_features) if out_features is not None else int(scales.shape[1])
+        out_shape = x.shape[:-1] + (n,)
         reshaped_x = x_in.reshape(-1, x_in.shape[-1])
 
         # Always use awq_gemm to avoid large temporary dequantized weight allocations.
-        out = ops.awq_gemm(reshaped_x, qweight, scales, qzeros, pack_factor)
+        # vLLM API: awq_gemm(input, qweight, qzeros, scales, split_k_iters)
+        split_k_iters = 1
+        if reshaped_x.is_contiguous() and qweight.is_contiguous() and qzeros.is_contiguous() and scales.is_contiguous():
+            out = torch.ops._C.awq_gemm(reshaped_x, qweight, qzeros, scales, split_k_iters)
+        else:
+            out = ops.awq_gemm(reshaped_x, qweight, qzeros, scales, split_k_iters)
 
         if bias is not None:
             out.add_(bias.to(dtype=out.dtype))

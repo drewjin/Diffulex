@@ -102,10 +102,7 @@ class DiffulexTPWorker:
             sid = self.add_request(prompt, sp)
             seqid_to_idx[sid] = idx
         outputs = [None] * len(prompts)
-        # Track per-step instantaneous throughput for display, and
-        # token/time totals for correct average throughput reporting.
-        last_prefill_throughput = 0.0
-        last_decode_throughput = 0.0
+        # Track token/time totals for correct average throughput reporting.
         prefill_total_tokens = 0
         decode_total_tokens = 0
         prefill_total_time = 0.0
@@ -125,17 +122,21 @@ class DiffulexTPWorker:
                 prefill_steps += 1
                 prefill_total_tokens += int(num_tokens)
                 prefill_total_time += float(dt)
-                last_prefill_throughput = (num_tokens / dt) if dt > 0 else 0.0
             else:
                 decode_steps += 1
                 decode_total_tokens += int(num_tokens)
                 decode_total_time += float(dt)
-                last_decode_throughput = (num_tokens / dt) if dt > 0 else 0.0
 
             if use_tqdm:
+                avg_prefill_throughput = (
+                    prefill_total_tokens / prefill_total_time if prefill_total_time > 0 else 0.0
+                )
+                avg_decode_throughput = (
+                    decode_total_tokens / decode_total_time if decode_total_time > 0 else 0.0
+                )
                 pbar.set_postfix({
-                    "Prefill": f"{int(last_prefill_throughput)}tok/s",
-                    "Decode": f"{int(last_decode_throughput)}tok/s",
+                    "Prefill(avg)": f"{int(avg_prefill_throughput)}tok/s",
+                    "Decode(avg)": f"{int(avg_decode_throughput)}tok/s",
                 })
             if cur_n_diff_steps:
                 for seq_id, n_step in cur_n_diff_steps.items():

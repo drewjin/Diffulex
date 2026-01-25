@@ -22,14 +22,10 @@ from diffulex.utils.quantization.registry import register_linear_strategy
 from diffulex.utils.quantization.strategy import LinearQuantizationStrategy
 
 
-def _require_vllm_ops():
-    try:
-        from vllm import _custom_ops as ops  # type: ignore
-    except Exception as e:  # pragma: no cover
-        raise RuntimeError(
-            "W8A8 需要 vLLM 的 CUDA 自定义算子（vllm._custom_ops）。"
-        ) from e
-    return ops
+try:
+    from vllm import _custom_ops as _vllm_ops  # type: ignore
+except Exception:  # pragma: no cover
+    _vllm_ops = None  # type: ignore
 
 
 @register_linear_strategy(weight_dtype="int8", act_dtype="int8")
@@ -42,6 +38,12 @@ class LinearInt8W8A8Strategy(LinearQuantizationStrategy):
         super().__init__()
         # Cache: id(weight) -> (qweight_int8 [N,K], w_scales_fp32 [N])
         self._weight_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        self._ops_available: bool = bool(
+            _vllm_ops is not None
+            and hasattr(torch.ops, "_C")
+            and hasattr(torch.ops._C, "dynamic_scaled_int8_quant")
+            and hasattr(torch.ops._C, "cutlass_scaled_mm")
+        )
 
     @property
     def name(self) -> str:
@@ -109,18 +111,48 @@ class LinearInt8W8A8Strategy(LinearQuantizationStrategy):
         bias: Optional[torch.Tensor],
         *,
         quant_kind: str,
-        **kwargs: Any,
+        quant_scales: Optional[torch.Tensor] = None,
+        out_features: Optional[int] = None,
     ) -> torch.Tensor:
         _ = quant_kind
 
-        ops = _require_vllm_ops()
+        # ---- Fast path (decode hot path) ----
+        # Preconditions are strict to minimize Python overhead.
+        # Expect:
+        # - qweight: int8 KxN with stride(0)==1
+        # - w_scales: float32 [1,N], contiguous
+        if (
+            self._ops_available
+            and _vllm_ops is not None
+            and x.dim() == 2
+            and x.device.type == "cuda"
+            and x.dtype in (torch.bfloat16, torch.float16)
+            and x.is_contiguous()
+            and weight is not None
+            and weight.dtype == torch.int8
+            and weight.device == x.device
+            and weight.stride(0) == 1
+            and quant_scales is not None
+            and quant_scales.device == x.device
+            and quant_scales.dtype == torch.float32
+            and quant_scales.dim() == 2
+            and quant_scales.is_contiguous()
+        ):
+            m, _k = x.shape
+            # Optionally validate N to catch wrong metadata early.
+            if out_features is None or int(out_features) == int(quant_scales.shape[1]):
+                x_q = torch.empty((m, _k), device=x.device, dtype=torch.int8)
+                x_s = torch.empty((m, 1), device=x.device, dtype=torch.float32)
+                torch.ops._C.dynamic_scaled_int8_quant(x_q, x, x_s, None)
+                out = torch.empty((m, int(quant_scales.shape[1])), device=x.device, dtype=x.dtype)
+                torch.ops._C.cutlass_scaled_mm(out, x_q, weight, x_s, quant_scales, bias)
+                return out
 
         # If weight already quantized by LinearBase.load-time quantization.
-        quant_scales = kwargs.get("quant_scales", None)
         if weight is not None and weight.dtype == torch.int8 and quant_scales is not None:
-            # Expected: qweight is K×N int8, quant_scales is [1,N] fp32
-            qweight = weight.to(device=x.device)
-            w_scales = quant_scales.to(device=x.device, dtype=torch.float32)
+            # Expected: qweight is K×N int8 (may be non-contiguous), quant_scales is [1,N] fp32
+            qweight = weight
+            w_scales = quant_scales.to(dtype=torch.float32)
         else:
             wid = id(weight)
             cached = self._weight_cache.get(wid)
@@ -138,8 +170,8 @@ class LinearInt8W8A8Strategy(LinearQuantizationStrategy):
         if x2.dtype not in (torch.bfloat16, torch.float16):
             x2 = x2.to(torch.bfloat16)
         # dynamic per-token int8 quant + fused GEMM_DQ
-        x_q, x_s, _ = ops.scaled_int8_quant(x2.contiguous(), scale=None, azp=None, symmetric=True)
-        y = ops.cutlass_scaled_mm(
+        x_q, x_s, _ = _vllm_ops.scaled_int8_quant(x2.contiguous(), scale=None, azp=None, symmetric=True)
+        y = _vllm_ops.cutlass_scaled_mm(
             x_q,
             qweight,
             scale_a=x_s,

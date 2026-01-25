@@ -78,6 +78,9 @@ class LinearBase(nn.Module):
         super().__init__()
         self.input_size = input_size
         self.output_size = output_size
+        # Cache forward output features (avoid per-call inference).
+        # Subclasses with TP partitions should overwrite this after partition sizes are known.
+        self._forward_out_features: int = int(output_size)
         self.tp_dim = tp_dim
         self.quant_kind = (quant_kind or "other").strip().lower() or "other"
         self.tp_rank = dist.get_rank()
@@ -86,6 +89,8 @@ class LinearBase(nn.Module):
         # NOTE: We keep these as buffers so they move with the module and do not appear as Parameters.
         self.register_buffer("quant_weight_int8", torch.empty(0, dtype=torch.int8), persistent=False)
         self.register_buffer("quant_scales", torch.empty(0, dtype=torch.bfloat16), persistent=False)
+        # Cache a 1xN view of scales to avoid per-call view/shape handling on hot paths.
+        self.register_buffer("quant_scales_1xn", torch.empty(0, dtype=torch.bfloat16), persistent=False)
         self.register_buffer("_weight_is_quantized", torch.tensor(False, dtype=torch.bool), persistent=False)
         
         # GPTQ/AWQ offline quantized weight storage (W4A16).
@@ -242,6 +247,13 @@ class LinearBase(nn.Module):
             scales = scales.to(device=module_device)
         if g_idx is not None and g_idx.device != module_device:
             g_idx = g_idx.to(device=module_device)
+
+        # Make packed tensors contiguous once at load-time (avoid per-call checks/copies).
+        qweight = qweight.contiguous()
+        qzeros = qzeros.contiguous()
+        scales = scales.contiguous()
+        if g_idx is not None:
+            g_idx = g_idx.contiguous()
 
         # group_size == -1 means channelwise in some ecosystems; vLLM normalizes -1 to K.
         group_size_norm = in_features if group_size == -1 else group_size
@@ -458,8 +470,8 @@ class LinearBase(nn.Module):
         # g_idx (act-order) handling: marlin expects sorted g_idx + sort indices; otherwise empty.
         if self.gptq_g_idx.numel() > 0:
             g_idx_sorted, g_idx_sort_indices = marlin_sort_g_idx(self.gptq_g_idx.to(device=device, dtype=torch.int32))
-            self.gptq_marlin_g_idx = g_idx_sorted
-            self.gptq_marlin_g_idx_sort_indices = g_idx_sort_indices
+            self.gptq_marlin_g_idx = g_idx_sorted.contiguous()
+            self.gptq_marlin_g_idx_sort_indices = g_idx_sort_indices.contiguous()
         else:
             self.gptq_marlin_g_idx = marlin_make_empty_g_idx(device)
             self.gptq_marlin_g_idx_sort_indices = marlin_make_empty_g_idx(device)
@@ -476,7 +488,7 @@ class LinearBase(nn.Module):
                 size_n=out_features,
                 num_bits=weight_bits,
                 is_a_8bit=False,
-            )
+            ).contiguous()
 
             # Permute scales to marlin format.
             self.gptq_marlin_scales = marlin_permute_scales(
@@ -485,7 +497,7 @@ class LinearBase(nn.Module):
                 size_n=out_features,
                 group_size=group_size,
                 is_a_8bit=False,
-            )
+            ).contiguous()
 
         # GPTQ Marlin only supports symmetric weights (no runtime zero-points).
         # Use empty zp to keep has_zp=False in the kernel.
@@ -542,30 +554,30 @@ class LinearBase(nn.Module):
 
         # Repack qweight to marlin format.
         self.awq_marlin_qweight = ops.awq_marlin_repack(
-            self.awq_qweight,
+            self.awq_qweight.contiguous(),
             size_k=in_features,
             size_n=out_features,
             num_bits=weight_bits,
             is_a_8bit=False,
-        )
+        ).contiguous()
 
         # Permute scales to marlin format.
         self.awq_marlin_scales = marlin_permute_scales(
-            self.awq_scales,
+            self.awq_scales.contiguous(),
             size_k=in_features,
             size_n=out_features,
             group_size=group_size,
             is_a_8bit=False,
-        )
+        ).contiguous()
 
         # Convert zero-points to marlin format.
         self.awq_marlin_zp = awq_to_marlin_zero_points(
-            self.awq_qzeros,
+            self.awq_qzeros.contiguous(),
             size_k=num_groups,
             size_n=out_features,
             num_bits=weight_bits,
             is_a_8bit=False,
-        )
+        ).contiguous()
 
         self._awq_marlin_is_prepared = torch.tensor(True, dtype=torch.bool, device=device)
 
@@ -598,19 +610,39 @@ class LinearBase(nn.Module):
         except Exception:
             strategy = None
         scale_dtype = torch.bfloat16
+        force_weight_contig = True
         if strategy is not None:
             weight_format = getattr(strategy, "linear_weight_format", None)
             act_format = getattr(strategy, "linear_act_format", None)
             # FP8 W8A16 uses float32 scales
             if weight_format in ("fp8_e4m3", "fp8_e5m2") and act_format == "bf16":
                 scale_dtype = torch.float32
-            # FP8 W8A8 and int8 W8A8 use float16 scales
-            elif act_format in ("int8", "fp8_e4m3", "fp8_e5m2"):
+            # W8A8 int8 uses float32 [1, N] weight scales in vLLM cutlass_scaled_mm path.
+            elif weight_format == "int8" and act_format == "int8":
+                scale_dtype = torch.float32
+                # vLLM CUTLASS scaled_mm expects int8 weight in KxN with stride(0)==1,
+                # which is typically produced as a transpose-view (non-contiguous).
+                # Do NOT force contiguous here; just avoid per-call conversions.
+                force_weight_contig = False
+            # FP8 W8A8 keeps float32 scales; also keep KxN transpose-view layout.
+            elif act_format in ("fp8_e4m3", "fp8_e5m2"):
+                scale_dtype = torch.float32
+                force_weight_contig = False
+            # Other int8/int4 mixed paths use float16 scales by default.
+            elif act_format == "int8":
                 scale_dtype = torch.float16
         if quant_scales.dtype != scale_dtype:
             quant_scales = quant_scales.to(dtype=scale_dtype)
+        # Make sure scales are contiguous once at load-time.
+        # NOTE: Some kernels require specific non-contiguous weight layouts (e.g., W8A8 KxN with stride(0)==1).
+        # We avoid per-call `is_contiguous/contiguous` checks while preserving required layouts.
+        if force_weight_contig:
+            quant_weight_int8 = quant_weight_int8.contiguous()
+        quant_scales = quant_scales.contiguous()
         self.quant_weight_int8 = quant_weight_int8
         self.quant_scales = quant_scales
+        # 1xN view for fused kernels expecting 2D scales.
+        self.quant_scales_1xn = quant_scales if quant_scales.dim() == 2 else quant_scales.view(1, -1)
         self._weight_is_quantized.fill_(True)
 
     def _maybe_promote_weight_to_quantized_at_runtime(
@@ -738,13 +770,13 @@ class LinearBase(nn.Module):
             raise RuntimeError(f"GPTQ bits 推断失败：pack_factor={pack_factor} 不满足 32%pack_factor==0")
         return 32 // pack_factor
 
-    def _maybe_int4_original_in_features_kwargs(self, strategy, x: torch.Tensor) -> dict:
+    def _maybe_int4_original_in_features_kwargs(self, strategy, x: torch.Tensor) -> Optional[dict]:
         """Some int4 kernels need original K (before packing)."""
         if strategy is None:
-            return {}
+            return None
         if getattr(strategy, "linear_weight_format", None) == "int4":
             return {"original_in_features": x.shape[1]}
-        return {}
+        return None
 
     def _build_offline_forward_kwargs(self, x: torch.Tensor, strategy) -> dict:
         """Build kwargs for offline GPTQ/AWQ (including Marlin variants)."""
@@ -830,10 +862,90 @@ class LinearBase(nn.Module):
         if self.has_offline_quantized_weight():
             if strategy is None:
                 raise RuntimeError("Offline quantized weight is present but no linear strategy is configured.")
+            weight_format = getattr(strategy, "linear_weight_format", None)
+            out_features, in_features, group_size = self._offline_meta()
+
+            # Avoid per-call kwargs dict construction on hot paths.
+            if weight_format == "gptq":
+                self._maybe_prepare_offline_gptq(x)
+                bits = self._infer_gptq_weight_bits(in_features=in_features)
+                return strategy.linear_forward(
+                    x,
+                    None,  # weight not used for offline quantized weights
+                    bias,
+                    quant_kind=self.quant_kind,
+                    gptq_qweight=self.gptq_qweight,
+                    gptq_qzeros=self.gptq_qzeros,
+                    gptq_scales=self.gptq_scales,
+                    gptq_g_idx=self.gptq_g_idx,
+                    weight_bits=bits,
+                    use_v2_format=False,
+                    out_features=out_features,
+                    in_features=in_features,
+                    group_size=group_size,
+                )
+
+            if weight_format == "awq":
+                # AWQ is 4-bit only in vLLM; bits stored in _offline_quant_bits.
+                bits = int(self._offline_quant_bits.item()) if self._offline_quant_bits.numel() > 0 else 4
+                pack_factor = 32 // max(1, bits)
+                return strategy.linear_forward(
+                    x,
+                    None,
+                    bias,
+                    quant_kind=self.quant_kind,
+                    awq_qweight=self.awq_qweight,
+                    awq_qzeros=self.awq_qzeros,
+                    awq_scales=self.awq_scales,
+                    pack_factor=pack_factor,
+                    out_features=out_features,
+                    in_features=in_features,
+                    group_size=group_size,
+                )
+
+            if weight_format == "gptq_marlin":
+                self._maybe_prepare_offline_gptq_marlin(x)
+                bits = self._infer_gptq_weight_bits(in_features=in_features)
+                return strategy.linear_forward(
+                    x,
+                    None,
+                    bias,
+                    quant_kind=self.quant_kind,
+                    qweight=self.gptq_marlin_qweight,
+                    scales=self.gptq_marlin_scales,
+                    zp=self.gptq_marlin_zp,
+                    g_idx=self.gptq_marlin_g_idx,
+                    g_idx_sort_indices=self.gptq_marlin_g_idx_sort_indices,
+                    workspace=self.gptq_marlin_workspace,
+                    in_features=in_features,
+                    out_features=out_features,
+                    group_size=group_size,
+                    weight_bits=bits,
+                    tp_dim=self.tp_dim,
+                )
+
+            if weight_format == "awq_marlin":
+                self._maybe_prepare_offline_awq_marlin(x)
+                return strategy.linear_forward(
+                    x,
+                    None,
+                    bias,
+                    quant_kind=self.quant_kind,
+                    qweight=self.awq_marlin_qweight,
+                    scales=self.awq_marlin_scales,
+                    zp=self.awq_marlin_zp,
+                    workspace=self.awq_marlin_workspace,
+                    in_features=in_features,
+                    out_features=out_features,
+                    group_size=group_size,
+                    tp_dim=self.tp_dim,
+                )
+
+            # Fallback: compatibility for any remaining strategies.
             kwargs = self._build_offline_forward_kwargs(x, strategy)
             return strategy.linear_forward(
                 x,
-                None,  # weight not used for offline quantized weights
+                None,
                 bias,
                 quant_kind=self.quant_kind,
                 **kwargs,
@@ -842,14 +954,65 @@ class LinearBase(nn.Module):
         if self.has_quantized_weight():
             if strategy is None:
                 raise RuntimeError("Quantized weight is present but no linear strategy is configured.")
-            kwargs = {"quant_scales": self.quant_scales}
-            kwargs.update(self._maybe_int4_original_in_features_kwargs(strategy, x))
+            # Hot path: avoid per-call dict construction when possible.
+            extra_kwargs = self._maybe_int4_original_in_features_kwargs(strategy, x)
+            # W8A16(AllSpark) expects scales in 1xN layout and needs explicit N.
+            if getattr(strategy, "name", "") == "linear_int8_w8a16":
+                if extra_kwargs:
+                    return strategy.linear_forward(
+                        x,
+                        self.quant_weight_int8,
+                        bias,
+                        quant_kind=self.quant_kind,
+                        quant_scales=self.quant_scales_1xn,
+                        out_features=self._forward_out_features,
+                        **extra_kwargs,
+                    )
+                return strategy.linear_forward(
+                    x,
+                    self.quant_weight_int8,
+                    bias,
+                    quant_kind=self.quant_kind,
+                    quant_scales=self.quant_scales_1xn,
+                    out_features=self._forward_out_features,
+                )
+
+            # W8A8 expects scales in 1xN layout and is sensitive to weight layout (KxN stride0==1).
+            if getattr(strategy, "name", "") == "linear_int8_w8a8":
+                if extra_kwargs:
+                    return strategy.linear_forward(
+                        x,
+                        self.quant_weight_int8,
+                        bias,
+                        quant_kind=self.quant_kind,
+                        quant_scales=self.quant_scales_1xn,
+                        out_features=self._forward_out_features,
+                        **extra_kwargs,
+                    )
+                return strategy.linear_forward(
+                    x,
+                    self.quant_weight_int8,
+                    bias,
+                    quant_kind=self.quant_kind,
+                    quant_scales=self.quant_scales_1xn,
+                    out_features=self._forward_out_features,
+                )
+
+            if extra_kwargs:
+                return strategy.linear_forward(
+                    x,
+                    self.quant_weight_int8,
+                    bias,
+                    quant_kind=self.quant_kind,
+                    quant_scales=self.quant_scales,
+                    **extra_kwargs,
+                )
             return strategy.linear_forward(
                 x,
                 self.quant_weight_int8,
                 bias,
                 quant_kind=self.quant_kind,
-                **kwargs,
+                quant_scales=self.quant_scales,
             )
 
         if strategy is None:
@@ -862,7 +1025,9 @@ class LinearBase(nn.Module):
         if weight is None:
             raise RuntimeError("Strategy is configured but weight is missing (expected bf16 weight).")
         kwargs = self._maybe_int4_original_in_features_kwargs(strategy, x)
-        return strategy.linear_forward(x, weight, bias, quant_kind=self.quant_kind, **kwargs)
+        if kwargs:
+            return strategy.linear_forward(x, weight, bias, quant_kind=self.quant_kind, **kwargs)
+        return strategy.linear_forward(x, weight, bias, quant_kind=self.quant_kind)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
@@ -915,6 +1080,7 @@ class ColumnParallelLinear(LinearBase, LoRAMixin):
         LinearBase.__init__(self, input_size, output_size, 0, quant_kind)
         self.input_size_per_partition = input_size
         self.output_size_per_partition = divide(output_size, self.tp_size)
+        self._forward_out_features = int(self.output_size_per_partition)
 
         self.weight = nn.Parameter(torch.empty(self.output_size_per_partition, self.input_size))
         self.weight.weight_loader = self.weight_loader

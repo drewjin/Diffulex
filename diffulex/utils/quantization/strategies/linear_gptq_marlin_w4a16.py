@@ -27,6 +27,7 @@ try:
         apply_gptq_marlin_linear,
         marlin_is_k_full,
         marlin_make_empty_g_idx,
+        should_use_atomic_add_reduce,
         marlin_permute_bias,
     )
     from vllm.scalar_type import scalar_types  # type: ignore
@@ -34,6 +35,7 @@ except Exception:  # pragma: no cover
     apply_gptq_marlin_linear = None  # type: ignore
     marlin_is_k_full = None  # type: ignore
     marlin_make_empty_g_idx = None  # type: ignore
+    should_use_atomic_add_reduce = None  # type: ignore
     marlin_permute_bias = None  # type: ignore
     scalar_types = None  # type: ignore
 
@@ -44,6 +46,13 @@ def _build_linear_gptq_marlin_w4a16() -> LinearQuantizationStrategy:
 
 
 class LinearGPTQMarlinW4A16Strategy(LinearQuantizationStrategy):
+    def __init__(self) -> None:
+        super().__init__()
+        self._available: bool = bool(apply_gptq_marlin_linear is not None and scalar_types is not None)
+        self._empty_cache: dict[int, torch.Tensor] = {}
+        self._bias_cache: dict[tuple[int, int], torch.Tensor] = {}
+        self._atomic_add_cache: dict[tuple[int, int, int, int, int], bool] = {}
+
     @property
     def name(self) -> str:
         return "linear_gptq_marlin_w4a16"
@@ -82,28 +91,28 @@ class LinearGPTQMarlinW4A16Strategy(LinearQuantizationStrategy):
     def linear_forward(
         self,
         x: torch.Tensor,
-        weight: torch.Tensor,
+        weight: Optional[torch.Tensor],
         bias: Optional[torch.Tensor],
         *,
         quant_kind: str,
-        **kwargs: Any,
+        qweight: torch.Tensor,
+        scales: torch.Tensor,
+        zp: torch.Tensor,
+        g_idx: Optional[torch.Tensor] = None,
+        g_idx_sort_indices: Optional[torch.Tensor] = None,
+        workspace: Optional[torch.Tensor] = None,
+        in_features: int = 0,
+        out_features: int = 0,
+        group_size: int = 128,
+        weight_bits: int = 0,
+        tp_dim: Optional[int] = None,
     ) -> torch.Tensor:
-        _ = quant_kind, weight
-        if apply_gptq_marlin_linear is None or scalar_types is None:
+        _ = quant_kind, weight, group_size
+        if not self._available or workspace is None:
             raise RuntimeError("gptq_marlin 需要 vLLM (marlin_utils + scalar_types)；当前环境不可用。")
 
-        qweight = kwargs.get("gptq_marlin_qweight", None)
-        scales = kwargs.get("gptq_marlin_scales", None)
-        zp = kwargs.get("gptq_marlin_zp", None)
-        g_idx = kwargs.get("gptq_marlin_g_idx", None)
-        g_idx_sort_indices = kwargs.get("gptq_marlin_g_idx_sort_indices", None)
-        workspace = kwargs.get("gptq_marlin_workspace", None)
-        in_features = int(kwargs.get("in_features", 0))
-        out_features = int(kwargs.get("out_features", 0))
-        weight_bits = int(kwargs.get("gptq_weight_bits", 0))
-
-        if any(t is None for t in (qweight, scales, zp, workspace)) or in_features <= 0 or out_features <= 0:
-            raise RuntimeError("gptq_marlin: missing prepared marlin tensors (qweight/scales/zp/workspace).")
+        if in_features <= 0 or out_features <= 0:
+            raise RuntimeError("gptq_marlin: missing in_features/out_features.")
 
         if weight_bits == 4:
             wtype = scalar_types.uint4b8
@@ -112,45 +121,84 @@ class LinearGPTQMarlinW4A16Strategy(LinearQuantizationStrategy):
         else:
             raise RuntimeError(f"gptq_marlin: unsupported weight_bits={weight_bits} (expected 4 or 8)")
 
-        # Align with vLLM Marlin: accept bf16/fp16 activations directly.
-        x_in = x
+        device = x.device
+        dev_key = int(device.index) if device.type == "cuda" and device.index is not None else -1
 
-        # g_idx can be empty (desc_act=False). Ensure correct dtype/device.
-        if g_idx is None or (isinstance(g_idx, torch.Tensor) and g_idx.numel() == 0):
-            g_idx_t = marlin_make_empty_g_idx(x.device) if marlin_make_empty_g_idx is not None else torch.empty((0,), device=x.device, dtype=torch.int32)
+        # g_idx can be empty (desc_act=False). Prefer already-correct tensors; avoid per-call to().
+        if g_idx is None or g_idx.numel() == 0:
+            empty = self._empty_cache.get(dev_key)
+            if empty is None:
+                empty = marlin_make_empty_g_idx(device) if marlin_make_empty_g_idx is not None else torch.empty((0,), device=device, dtype=torch.int32)
+                self._empty_cache[dev_key] = empty
+            g_idx_t = empty
         else:
-            g_idx_t = g_idx.to(device=x.device, dtype=torch.int32)
-        if g_idx_sort_indices is None or (isinstance(g_idx_sort_indices, torch.Tensor) and g_idx_sort_indices.numel() == 0):
-            g_idx_sort_t = marlin_make_empty_g_idx(x.device) if marlin_make_empty_g_idx is not None else torch.empty((0,), device=x.device, dtype=torch.int32)
+            g_idx_t = g_idx
+        if g_idx_sort_indices is None or g_idx_sort_indices.numel() == 0:
+            empty = self._empty_cache.get(dev_key)
+            if empty is None:
+                empty = marlin_make_empty_g_idx(device) if marlin_make_empty_g_idx is not None else torch.empty((0,), device=device, dtype=torch.int32)
+                self._empty_cache[dev_key] = empty
+            g_idx_sort_t = empty
         else:
-            g_idx_sort_t = g_idx_sort_indices.to(device=x.device, dtype=torch.int32)
+            g_idx_sort_t = g_idx_sort_indices
 
         # Determine whether K is full (needed by marlin kernel). Row-parallel layers set tp_dim=1 in Diffulex.
-        row_parallel = bool(kwargs.get("tp_dim", None) == 1)
+        row_parallel = bool(tp_dim == 1)
         has_g_idx = bool(g_idx_t.numel() > 0)
-        if marlin_is_k_full is None:
-            is_k_full = True
-        else:
-            is_k_full = marlin_is_k_full(has_g_idx, row_parallel)
+        is_k_full = True if marlin_is_k_full is None else marlin_is_k_full(has_g_idx, row_parallel)
 
+        # Cache permuted bias (Marlin expects permuted bias order).
         marlin_bias = None
         if bias is not None:
-            marlin_bias = marlin_permute_bias(bias) if marlin_permute_bias is not None else bias
+            bkey = (dev_key, int(bias.data_ptr()))
+            marlin_bias = self._bias_cache.get(bkey)
+            if marlin_bias is None:
+                marlin_bias = marlin_permute_bias(bias) if marlin_permute_bias is not None else bias
+                self._bias_cache[bkey] = marlin_bias
 
-        out = apply_gptq_marlin_linear(
-            input=x_in,
-            weight=qweight,
-            weight_scale=scales,
-            weight_zp=zp,
-            g_idx=g_idx_t,
-            g_idx_sort_indices=g_idx_sort_t,
-            workspace=workspace,
-            wtype=wtype,
-            output_size_per_partition=out_features,
-            input_size_per_partition=in_features,
-            is_k_full=is_k_full,
-            bias=marlin_bias,
-            input_dtype=None,
+        # Flatten like F.linear: [*,K] -> [M,K]
+        reshaped_x = x.reshape(-1, x.shape[-1])
+        out_shape = x.shape[:-1] + (int(out_features),)
+
+        # Cache heuristic for atomic-add reduction (depends on M/N/K, device, dtype).
+        m = int(reshaped_x.shape[0])
+        n = int(out_features)
+        k = int(reshaped_x.shape[1])
+        dtype_id = 1 if reshaped_x.dtype == torch.bfloat16 else (2 if reshaped_x.dtype == torch.float16 else 0)
+        use_atomic_add = False
+        if should_use_atomic_add_reduce is not None:
+            akey = (dev_key, dtype_id, m, n, k)
+            cached = self._atomic_add_cache.get(akey)
+            if cached is None:
+                cached = bool(
+                    should_use_atomic_add_reduce(
+                        m=m, n=n, k=k, device=device, dtype=reshaped_x.dtype
+                    )
+                )
+                self._atomic_add_cache[akey] = cached
+            use_atomic_add = cached
+
+        # Directly call the underlying CUDA op to minimize Python glue.
+        out = torch.ops._C.gptq_marlin_gemm(
+            reshaped_x,
+            None,
+            qweight,
+            marlin_bias,
+            scales,
+            None,
+            None,
+            zp,
+            g_idx_t,
+            g_idx_sort_t,
+            workspace,
+            wtype.id,
+            m,
+            n,
+            k,
+            is_k_full,
+            use_atomic_add,
+            True,  # use_fp32_reduce
+            False,  # is_zp_float
         )
-        return out
+        return out.reshape(out_shape)
 
