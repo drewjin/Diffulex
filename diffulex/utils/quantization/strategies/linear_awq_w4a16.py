@@ -23,6 +23,12 @@ try:
 except Exception:  # pragma: no cover
     ops = None  # type: ignore
 
+try:
+    # Triton fallback path for AWQ GEMM (works even when C++/CUDA ops are not built).
+    from vllm.model_executor.layers.quantization.awq_triton import awq_gemm_triton  # type: ignore
+except Exception:  # pragma: no cover
+    awq_gemm_triton = None  # type: ignore
+
 
 @register_linear_strategy(weight_dtype="awq", act_dtype="bf16")
 def _build_linear_awq_w4a16() -> LinearQuantizationStrategy:
@@ -32,17 +38,23 @@ def _build_linear_awq_w4a16() -> LinearQuantizationStrategy:
 class LinearAWQW4A16Strategy(LinearQuantizationStrategy):
     def __init__(self) -> None:
         super().__init__()
-        # Resolve the concrete kernel entry point once (avoid per-call dispatch).
+        # Resolve the concrete kernel entry points once (avoid per-call dispatch).
+        self._awq_gemm_cpp = None
+        self._awq_gemm_triton = awq_gemm_triton
+
         awq_gemm = None
         try:
             if hasattr(torch.ops, "_C") and hasattr(torch.ops._C, "awq_gemm"):
                 awq_gemm = torch.ops._C.awq_gemm
         except Exception:
             awq_gemm = None
-        if awq_gemm is None and ops is not None and hasattr(ops, "awq_gemm"):
-            awq_gemm = ops.awq_gemm
-        self._awq_gemm = awq_gemm
-        self._ops_available: bool = bool(self._awq_gemm is not None)
+        # Prefer the real C++ op if present; otherwise keep `None` and fall back to Triton.
+        self._awq_gemm_cpp = awq_gemm
+        # Keep the python wrapper as a last resort (it may route to Triton or to torch.ops._C).
+        self._awq_gemm_py = ops.awq_gemm if (ops is not None and hasattr(ops, "awq_gemm")) else None
+        self._ops_available: bool = bool(
+            self._awq_gemm_cpp is not None or self._awq_gemm_triton is not None or self._awq_gemm_py is not None
+        )
 
     @property
     def name(self) -> str:
@@ -122,9 +134,21 @@ class LinearAWQW4A16Strategy(LinearQuantizationStrategy):
         reshaped_x = x_in.reshape(-1, x_in.shape[-1])
 
         # Always use awq_gemm to avoid large temporary dequantized weight allocations.
-        # vLLM API: awq_gemm(input, qweight, qzeros, scales, split_k_iters)
+        # vLLM API:
+        # - C++ op: awq_gemm(input, qweight, scales, qzeros, split_k_iters)
+        # - Triton : awq_gemm_triton(input, qweight, scales, qzeros, split_k_iters)
         split_k_iters = 1
-        out = self._awq_gemm(reshaped_x, qweight, qzeros, scales, split_k_iters)  # type: ignore[misc]
+        if self._awq_gemm_triton is not None:
+            out = self._awq_gemm_triton(reshaped_x, qweight, scales, qzeros, split_k_iters)  # type: ignore[misc]
+        elif self._awq_gemm_cpp is not None:
+            out = self._awq_gemm_cpp(reshaped_x, qweight, scales, qzeros, split_k_iters)  # type: ignore[misc]
+        elif self._awq_gemm_py is not None:
+            out = self._awq_gemm_py(reshaped_x, qweight, scales, qzeros, split_k_iters)  # type: ignore[misc]
+        else:
+            raise RuntimeError(
+                "vLLM is required for AWQ W4A16 but no available kernel entry point was found "
+                "(missing both Triton and C++ awq_gemm)."
+            )
 
         if bias is not None:
             out.add_(bias.to(dtype=out.dtype))

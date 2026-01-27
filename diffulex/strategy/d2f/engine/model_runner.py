@@ -294,30 +294,41 @@ class D2FModelRunner(ModelRunnerBase):
             return self.model.compute_logits(self.model(input_ids, positions))
         num_tokens = input_ids.size(0)
         context = fetch_d2f_attn_metadata()
-        bucket_tokens = next(x for x in self.graph_bs if x >= num_tokens)
+        candidates = [x for x in self.graph_bs if x >= num_tokens]
+        if not candidates:
+            # Safety: fall back if capture didn't include a large-enough bucket.
+            return self.model.compute_logits(self.model(input_ids, positions))
+        bucket_tokens = candidates[0]
         graph = self.graphs[bucket_tokens]
         graph_vars = self.graph_vars
-        for key, value in graph_vars.items():
-            if key != "outputs":
-                value.zero_()
+        # Safety: fall back if runtime batch exceeds captured metadata capacity.
+        num_seqs = int(context.context_lens.numel())
+        max_num_seqs_for_graph = int(graph_vars["context_lens"].numel())
+        if num_seqs > max_num_seqs_for_graph:
+            return self.model.compute_logits(self.model(input_ids, positions))
+
+        # Reset buffers to safe defaults (avoid "0" being interpreted as a valid index).
+        graph_vars["input_ids"].zero_()
+        graph_vars["positions"].zero_()
+        graph_vars["slot_mapping"].fill_(-1)
+        graph_vars["context_lens"].zero_()
+        graph_vars["block_tables"].fill_(-1)
         graph_vars["input_ids"][:num_tokens] = input_ids
         graph_vars["positions"][:num_tokens] = positions
         graph_vars["slot_mapping"][:num_tokens] = context.slot_mapping
-        num_seqs = int(context.context_lens.numel())
         graph_vars["context_lens"][:num_seqs] = context.context_lens
         # cu_seqlens are required by unified paged-attn decode kernels.
         if getattr(context, "cu_seqlens_q", None) is not None:
+            # Pad to captured length so "extra" sequences become 0-length.
+            graph_vars["cu_seqlens_q"].fill_(int(num_tokens))
             graph_vars["cu_seqlens_q"][: num_seqs + 1] = context.cu_seqlens_q
-            bucket_num_seqs = int(bucket_tokens // max(1, int(self.diffusion_block_size)))
-            if bucket_num_seqs > num_seqs:
-                graph_vars["cu_seqlens_q"][num_seqs + 1 : bucket_num_seqs + 1].fill_(int(num_tokens))
         if getattr(context, "cu_seqlens_k", None) is not None:
+            last_k = int(context.cu_seqlens_k[num_seqs].item())
+            graph_vars["cu_seqlens_k"].fill_(last_k)
             graph_vars["cu_seqlens_k"][: num_seqs + 1] = context.cu_seqlens_k
-            bucket_num_seqs = int(bucket_tokens // max(1, int(self.diffusion_block_size)))
-            if bucket_num_seqs > num_seqs:
-                last_k = context.cu_seqlens_k[num_seqs]
-                graph_vars["cu_seqlens_k"][num_seqs + 1 : bucket_num_seqs + 1] = last_k
-        graph_vars["block_tables"][:num_seqs, : context.block_tables.size(1)] = context.block_tables
+
+        bt_cols = min(int(graph_vars["block_tables"].size(1)), int(context.block_tables.size(1)))
+        graph_vars["block_tables"][:num_seqs, :bt_cols] = context.block_tables[:, :bt_cols]
         graph.replay()
         return self.model.compute_logits(graph_vars["outputs"][:num_tokens])
 
@@ -355,8 +366,14 @@ class D2FModelRunner(ModelRunnerBase):
         diffusion_block_size = int(self.diffusion_block_size)
         max_num_seqs = int(self.config.max_num_seqs)
         # Graph path is only used when num_tokens <= 512.
-        max_num_seqs_for_graph = max(1, min(max_num_seqs, 512 // max(1, diffusion_block_size)))
-        max_num_tokens = max_num_seqs_for_graph * diffusion_block_size
+        #
+        # IMPORTANT:
+        # In D2F decode, `num_tokens` (sum of per-seq seqlen_q) is NOT guaranteed to equal
+        # `num_seqs * diffusion_block_size`. A single seq can contribute multiple diffusion blocks,
+        # so we must bucket by `num_tokens` directly and keep metadata tensors sized by
+        # `max_num_seqs_for_graph` (padding unused seqs to 0-length via cu_seqlens).
+        max_num_seqs_for_graph = max(1, min(max_num_seqs, 512))
+        max_num_tokens = 512
         max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
 
         # Allocate graph buffers on the same device/dtype as the model.
@@ -371,33 +388,38 @@ class D2FModelRunner(ModelRunnerBase):
         # Allocate max-size graph buffers.
         input_ids = torch.zeros(max_num_tokens, dtype=torch.int64, device=graph_device)
         positions = torch.zeros(max_num_tokens, dtype=torch.int64, device=graph_device)
-        slot_mapping = torch.zeros(max_num_tokens, dtype=torch.int32, device=graph_device)
+        slot_mapping = torch.full((max_num_tokens,), -1, dtype=torch.int32, device=graph_device)
         context_lens = torch.zeros(max_num_seqs_for_graph, dtype=torch.int32, device=graph_device)
-        block_tables = torch.zeros(max_num_seqs_for_graph, max_num_blocks, dtype=torch.int32, device=graph_device)
+        block_tables = torch.full((max_num_seqs_for_graph, max_num_blocks), -1, dtype=torch.int32, device=graph_device)
         outputs = torch.zeros(max_num_tokens, hf_config.hidden_size, dtype=graph_dtype, device=graph_device)
         cu_seqlens_q = torch.zeros(max_num_seqs_for_graph + 1, dtype=torch.int32, device=graph_device)
         cu_seqlens_k = torch.zeros(max_num_seqs_for_graph + 1, dtype=torch.int32, device=graph_device)
 
-        # Capture bucketed graphs by num_tokens (bucketed by num_seqs * diffusion_block_size).
+        # Capture bucketed graphs by total num_tokens.
         self.graph_bs = []
-        seq_bs_list = [1, 2, 4, 8] + list(range(16, max_num_seqs_for_graph + 1, 16))
-        for num_seqs in sorted(set([b for b in seq_bs_list if b <= max_num_seqs_for_graph] + [max_num_seqs_for_graph])):
-            self.graph_bs.append(int(num_seqs) * diffusion_block_size)
+        # Keep buckets aligned to diffusion_block_size for stable kernel shapes.
+        for t in range(diffusion_block_size, max_num_tokens + 1, diffusion_block_size):
+            self.graph_bs.append(int(t))
         self.graphs = {}
         self.graph_pool = None
 
         for num_tokens in tqdm(reversed(self.graph_bs), desc="Capturing CUDA graphs"):
-            num_seqs = int(num_tokens // diffusion_block_size)
+            num_seqs = int(max_num_seqs_for_graph)
             graph = torch.cuda.CUDAGraph()
             # Fill placeholder metadata with valid monotonic cu_seqlens to satisfy kernel assertions.
-            cu_seqlens_q[: num_seqs + 1] = (
-                torch.arange(num_seqs + 1, dtype=torch.int32, device=graph_device) * diffusion_block_size
-            )
+            # IMPORTANT: cu_seqlens_q must be non-decreasing and end at `num_tokens`
+            # (it is used to index into Q/slot_mapping which are length `num_tokens`).
+            # Use a simple placeholder: put all Q tokens into the first seq and make
+            # the remaining seqs 0-length.
+            cu_seqlens_q[: num_seqs + 1].fill_(int(num_tokens))
+            cu_seqlens_q[0] = 0
             # Use a conservative max-seqlen for K to keep shapes stable; values are overwritten before replay.
             cu_seqlens_k[: num_seqs + 1] = (
                 torch.arange(num_seqs + 1, dtype=torch.int32, device=graph_device) * int(config.max_model_len)
             )
             context_lens[:num_seqs].fill_(int(config.max_model_len))
+            # Use a benign placeholder block table for the first seq.
+            block_tables[:1].zero_()
             # For static decode, use placeholder metadata tensors; per-step values are copied
             # into `graph_vars` before replay.
             set_d2f_attn_metadata(
@@ -406,7 +428,7 @@ class D2FModelRunner(ModelRunnerBase):
                 context_lens=context_lens[:num_seqs],
                 cu_seqlens_q=cu_seqlens_q[: num_seqs + 1],
                 cu_seqlens_k=cu_seqlens_k[: num_seqs + 1],
-                max_seqlen_q=diffusion_block_size,
+                max_seqlen_q=int(num_tokens),
                 max_seqlen_k=int(config.max_model_len),
                 block_tables=block_tables[:num_seqs],
                 kv_cache_layout=self.config.kv_cache_layout,

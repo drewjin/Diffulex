@@ -32,7 +32,8 @@ class Config:
     # Distributed comm (per tensor-parallel group). When using multiple DP
     # replicas on one host, assign unique master_port per replica.
     master_addr: str = "localhost"
-    master_port: int = 2333
+    # Allow overriding to avoid port collisions in multi-run/CI environments.
+    master_port: int = int(os.environ.get("DIFFULEX_MASTER_PORT", "2333"))
     # Shared memory segment name for intra-TP RPC; must be unique per DP group.
     shm_name: str = "diffulex_shm"
     # Start device index for this TP group (set by DP launcher).

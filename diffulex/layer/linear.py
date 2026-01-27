@@ -432,7 +432,9 @@ class _DirectAWQGemmPlan(_ForwardPlanBase):
         if not reshaped_x.is_contiguous():
             reshaped_x = reshaped_x.contiguous()
 
-        out = self._awq_gemm(reshaped_x, self._qweight, self._qzeros, self._scales, self._split_k_iters)
+        # vLLM AWQ GEMM entrypoints (C++ op and Triton fallback) use the same order:
+        #   awq_gemm(input, qweight, scales, qzeros, split_k_iters)
+        out = self._awq_gemm(reshaped_x, self._qweight, self._scales, self._qzeros, self._split_k_iters)
         if self._bias is not None:
             out.add_(self._bias.to(dtype=out.dtype))
         out = out.reshape(x.shape[:-1] + (self._out_features,))
@@ -1978,8 +1980,9 @@ class LinearBase(nn.Module):
             return F.linear(x, weight, bias)
 
         weight = getattr(self, "weight", None)
-        if weight is None:
-            raise RuntimeError("Strategy is configured but weight is missing (expected bf16 weight).")
+        # NOTE: For offline-quantized strategies (e.g. GPTQ/AWQ/Marlin), the original
+        # bf16 weight may be intentionally removed after loading to save memory.
+        # In that case, the quantization strategy must be able to run without it.
         kwargs = self._maybe_int4_original_in_features_kwargs(strategy, x)
         if kwargs:
             return strategy.linear_forward(x, weight, bias, quant_kind=self.quant_kind, **kwargs)

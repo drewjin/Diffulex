@@ -144,6 +144,22 @@ def _set_offline_gptq_marlin_weight(
     module._offline_quant_out_features = torch.tensor(out_features, dtype=torch.int32, device=module_device)
     module._offline_quant_in_features = torch.tensor(in_features, dtype=torch.int32, device=module_device)
     module._gptq_is_shuffled = torch.tensor(False, dtype=torch.bool, device=module_device)
+    # Keep Python-side mirrors in sync; runtime fast paths rely on these and
+    # must not `.item()` from CUDA tensors (graph capture / perf).
+    if hasattr(module, "_offline_quant_format_py"):
+        module._offline_quant_format_py = 1
+    if hasattr(module, "_offline_quant_bits_py"):
+        module._offline_quant_bits_py = int(bits)
+    if hasattr(module, "_offline_quant_group_size_py"):
+        module._offline_quant_group_size_py = int(group_size)
+    if hasattr(module, "_offline_quant_out_features_py"):
+        module._offline_quant_out_features_py = int(out_features)
+    if hasattr(module, "_offline_quant_in_features_py"):
+        module._offline_quant_in_features_py = int(in_features)
+    if hasattr(module, "_gptq_is_shuffled_py"):
+        module._gptq_is_shuffled_py = False
+    if hasattr(module, "_gptq_marlin_is_prepared_py"):
+        module._gptq_marlin_is_prepared_py = False
 
     # Reset marlin-prep caches (workspace/zp/g_idx meta will be created on first forward).
     module._gptq_marlin_is_prepared = torch.tensor(False, dtype=torch.bool, device=module_device)

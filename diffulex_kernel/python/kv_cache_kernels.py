@@ -880,6 +880,20 @@ def store_kvcache_unified_layout(key: torch.Tensor, value: torch.Tensor,
     Store KV cache (unified layout).
     Dynamically selects the appropriate kernel based on quantization strategy from context.
     """
+    # `slot_mapping` is expected to have one entry per token in `key/value` (dimension 0).
+    # In some flows (e.g. prefix-cache / partial-prefill), metadata may carry a longer
+    # mapping for the full sequence while `key/value` only contain the suffix tokens
+    # actually computed this step. In that case, align by taking the tail.
+    N = int(key.shape[0])
+    if int(slot_mapping.numel()) != N:
+        if int(slot_mapping.numel()) > N:
+            slot_mapping = slot_mapping[-N:]
+        else:
+            raise AssertionError(
+                f"slot_mapping is shorter than key/value tokens: "
+                f"N={N}, slot_mapping.numel()={int(slot_mapping.numel())}"
+            )
+
     from diffulex.utils.quantization.context import get_kv_cache_strategy
     strategy = get_kv_cache_strategy()
     if strategy is None:
