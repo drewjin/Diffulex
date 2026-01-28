@@ -59,6 +59,11 @@ class Config:
     linear_attn_act_dtype: str = "bf16"
     linear_mlp_act_dtype: str = "bf16"
 
+    # Kernel tuning knobs (avoid environment-variable based tuning in library code).
+    # Currently used by some W8A16 linear strategies.
+    linear_w8a16_quant_block_n: int = 256
+    linear_w8a16_allspark_cublas_m_threshold: int = 256
+
     def __post_init__(self):
         assert os.path.isdir(self.model)
         assert self.kvcache_block_size % 16 == 0

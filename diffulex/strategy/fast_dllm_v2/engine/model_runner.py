@@ -187,6 +187,16 @@ class FastDLLMV2ModelRunner(ModelRunnerBase):
 
     @torch.inference_mode()
     def capture_cudagraph(self):
+        # Enable per-layer forward-plan dispatch to stabilize capture and minimize
+        # Python branching inside the captured region.
+        try:
+            from diffulex.layer.linear import LinearBase
+            for m in self.model.modules():
+                if isinstance(m, LinearBase):
+                    m.enable_forward_plan(True)
+        except Exception:
+            pass
+
         set_warming_up(True)
         config = self.config
         hf_config = config.hf_config

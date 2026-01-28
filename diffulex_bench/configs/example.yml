@@ -20,7 +20,7 @@ engine:
   
   # Memory and capacity configuration
   gpu_memory_utilization: 0.7
-  max_model_len: 2048
+  max_model_len: 4096
   max_num_batched_tokens: 4096
   max_num_seqs: 128
   

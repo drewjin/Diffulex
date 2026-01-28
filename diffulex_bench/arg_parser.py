@@ -211,6 +211,13 @@ Examples:
         help="Enforce eager mode (disable CUDA graphs)",
     )
     parser.add_argument(
+        "--no-enforce-eager",
+        dest="enforce_eager",
+        action="store_false",
+        help="Disable eager mode (enable CUDA graphs when supported)",
+    )
+    parser.set_defaults(enforce_eager=None)
+    parser.add_argument(
         "--kv-cache-layout",
         type=str,
         default="unified",

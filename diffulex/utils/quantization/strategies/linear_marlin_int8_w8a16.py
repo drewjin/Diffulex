@@ -1,24 +1,18 @@
-"""
-Marlin-style (vLLM AllSpark) W8A16 Linear quantization strategy.
+"""W8A16 Linear quantization strategy using vLLM custom ops.
 
-Goal:
-- Replace Diffulex current W8A16 path (TileLang kernel that casts int8->bf16 inside)
-  with a vLLM-like fused path for decode small-M:
-  - per-out-channel int8 quantization (stored as uint8 with +128 bias)
-  - one-time N32K16 reorder (AllSpark repack)
-  - fused dequant + GEMM kernel (AllSpark w8a16 gemm)
+This strategy uses vLLM's fused AllSpark W8A16 path via `vllm._custom_ops`:
+- per-out-channel int8 quantization stored as uint8 (+128 bias)
+- one-time N32K16 reorder (AllSpark repack)
+- fused dequant + GEMM (AllSpark w8a16 gemm)
 
-Notes:
-- Despite the filename mentioning "marlin", the actual fused kernel we vendor is
-  vLLM's AllSpark Ampere W8A16 fused GEMM, which is the effective INT8 W8A16
-  fast path in vLLM for this use-case.
-- Fallback behavior is critical: if the extension is unavailable, or shapes are
-  unsupported (e.g., K%16!=0), we fall back to existing TileLang W8A16 or BF16.
+Important:
+- We intentionally do NOT vendor/compile a local AllSpark/Marlin extension in
+  Diffulex anymore. If `vllm._custom_ops` is unavailable, this strategy fails
+  fast (instead of silently compiling or falling back to a slow/oom-prone path).
 """
 
 from __future__ import annotations
 
-import os
 from typing import Any, Optional
 
 import torch
@@ -27,27 +21,30 @@ import torch.nn.functional as F
 from diffulex.utils.quantization.registry import register_linear_strategy
 from diffulex.utils.quantization.strategy import LinearQuantizationStrategy
 
-# Optional: existing TileLang fallback (already used by linear_int8_w8a16.py)
 try:
-    from diffulex_kernel.python.linear_kernels import w8a16_gemm as _tilelang_w8a16_gemm
-    _TILELANG_AVAILABLE = True
+    import vllm._custom_ops as _vllm_ops
 except Exception:
-    _tilelang_w8a16_gemm = None
-    _TILELANG_AVAILABLE = False
+    _vllm_ops = None
 
-# Vendored vLLM-style fused W8A16 (AllSpark) ops.
-try:
-    from diffulex_kernel.python.marlin_ops import (  # noqa: F401
-        allspark_w8a16_gemm as _allspark_w8a16_gemm,
-        rearrange_kn_weight_as_n32k16_order as _allspark_repack,
-        is_available as _allspark_is_available,
+
+def _allspark_is_available() -> bool:
+    return bool(
+        _vllm_ops is not None
+        and hasattr(_vllm_ops, "allspark_w8a16_gemm")
+        and hasattr(_vllm_ops, "allspark_repack_weight")
     )
-except Exception:
-    _allspark_w8a16_gemm = None
-    _allspark_repack = None
 
-    def _allspark_is_available() -> bool:
-        return False
+def _allspark_repack_weight(b_qweight_kn: torch.Tensor, scales_1xn: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Repack KxN uint8 qweight + 1xN scales into (N_32,K) + (1,N_32) for AllSpark GEMM."""
+    if _vllm_ops is None or not hasattr(_vllm_ops, "allspark_repack_weight"):
+        raise RuntimeError("vLLM custom ops are unavailable: missing `allspark_repack_weight`.")
+    q_reorder, s_reorder, _ = _vllm_ops.allspark_repack_weight(
+        b_qweight_kn,
+        scales_1xn,
+        None,
+        False,
+    )
+    return q_reorder, s_reorder
 
 
 @register_linear_strategy(weight_dtype="marlin_int8", act_dtype="bf16")
@@ -56,16 +53,40 @@ def _build_linear_marlin_int8_w8a16() -> LinearQuantizationStrategy:
 
 
 class LinearMarlinInt8W8A16Strategy(LinearQuantizationStrategy):
-    """W8A16 strategy using vendored vLLM AllSpark fused GEMM + repack."""
+    """W8A16 strategy using vLLM custom ops (AllSpark fused GEMM + repack)."""
 
     def __init__(self) -> None:
         super().__init__()
         # Cache for bf16 Parameters only (load-time quantized path bypasses this).
         self._weight_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        # Cache device info and thresholds to reduce per-call CPU overhead.
+        self._sm_info_cache: dict[int, tuple[int, int]] = {}
+        self._quant_block_n: int = 256
+        self._cublas_m_thr: int = 256
+        # One-time availability check (avoid calling `_allspark_is_available()` on every linear).
+        self._allspark_available: bool = _allspark_is_available()
+
+    def configure(self, *, diffulex_config: Any | None = None) -> None:
+        # Prefer explicit config fields over environment-variable based tuning.
+        if diffulex_config is None:
+            return
+        try:
+            bn = int(getattr(diffulex_config, "linear_w8a16_quant_block_n", self._quant_block_n))
+            self._quant_block_n = max(1, bn)
+        except Exception:
+            pass
+        try:
+            thr = int(getattr(diffulex_config, "linear_w8a16_allspark_cublas_m_threshold", self._cublas_m_thr))
+            self._cublas_m_thr = max(1, thr)
+        except Exception:
+            pass
 
     @property
     def name(self) -> str:
-        return "linear_marlin_int8_w8a16"
+        # NOTE: Keep strategy naming consistent with the public W8A16 INT8 path.
+        # The underlying implementation is a Marlin/AllSpark-style fused kernel,
+        # but the user-facing strategy name should not be tied to a particular kernel brand.
+        return "linear_int8_w8a16"
 
     @property
     def linear_weight_format(self) -> str:
@@ -148,44 +169,49 @@ class LinearMarlinInt8W8A16Strategy(LinearQuantizationStrategy):
         abs_max = torch.abs(weight).max(dim=-1)[0]  # [N]
         scales = (abs_max.clamp(min=1e-8) / 127.0).to(dtype=torch.bfloat16)  # [N]
 
-        # Quantize to signed int8, then store as uint8 with +128 bias.
-        w_fp32 = weight.to(torch.float32)
-        s_fp32 = scales.to(torch.float32).unsqueeze(-1)  # [N,1]
-        q_i8 = torch.round(w_fp32 / s_fp32).clamp(-128, 127).to(torch.int16)  # [N,K]
-        q_u8 = (q_i8 + 128).to(torch.uint8)  # [N,K] in [0,255]
+        # IMPORTANT (OOM fix):
+        # Avoid allocating a full [N,K] fp32 copy (and an extra transpose buffer).
+        # Quantize in small row blocks and (when using AllSpark) write directly into
+        # the repack input layout B_kn=[K,N], so we never materialize q_u8 + transpose.
+        block_n = max(1, int(self._quant_block_n))
 
-        if not _allspark_is_available() or _allspark_repack is None:
-            # Fallback storage (no reorder). Keep [N,K] and [N].
+        if self._allspark_available:
+            # AllSpark repack expects B in (K,N) contiguous layout.
+            b_kn = torch.empty((k, n), device=weight.device, dtype=torch.uint8)  # [K,N]
+            for i in range(0, n, block_n):
+                j = min(i + block_n, n)
+                w_blk = weight[i:j, :]  # [B,K]
+                s_blk = scales[i:j].unsqueeze(-1)  # [B,1]
+                # Quantize to signed int in bf16 to minimize temporary memory.
+                q_i16 = torch.round(w_blk / s_blk).clamp(-128, 127).to(torch.int16)  # [B,K]
+                q_u8_blk = (q_i16 + 128).to(torch.uint8)  # [B,K]
+                # Write directly into [K,N] buffer.
+                b_kn[:, i:j] = q_u8_blk.transpose(0, 1)
+        else:
+            # Fallback storage (no reorder). Keep [N,K] and [N] (padded to N_32).
             # Note: forward will detect unavailable allspark and fallback further.
+            q_pad = torch.full((n_32, k), 128, device=weight.device, dtype=torch.uint8)
+            for i in range(0, n, block_n):
+                j = min(i + block_n, n)
+                w_blk = weight[i:j, :]  # [B,K]
+                s_blk = scales[i:j].unsqueeze(-1)  # [B,1]
+                q_i16 = torch.round(w_blk / s_blk).clamp(-128, 127).to(torch.int16)  # [B,K]
+                q_pad[i:j, :] = (q_i16 + 128).to(torch.uint8)
             if n_32 != n:
-                q_pad = torch.full((n_32, k), 128, device=q_u8.device, dtype=torch.uint8)
-                q_pad[:n, :] = q_u8
                 s_pad = torch.zeros((n_32,), device=scales.device, dtype=torch.bfloat16)
                 s_pad[:n] = scales
                 return q_pad.contiguous(), s_pad.contiguous()
-            return q_u8.contiguous(), scales.contiguous()
+            return q_pad[:n, :].contiguous(), scales.contiguous()
 
-        # AllSpark repack expects B in (K,N) contiguous layout.
-        b_kn = q_u8.transpose(0, 1).contiguous()  # [K,N]
-
-        q_reorder = torch.empty((n_32, k), device=b_kn.device, dtype=torch.uint8)
-        s_reorder = torch.empty((n_32,), device=scales.device, dtype=torch.bfloat16)
-
-        # No zero-point path for symmetric signed int8 (bias128 already handled).
-        _allspark_repack(
-            b_kn,
-            scales.contiguous(),
-            None,
-            False,  # has_zp
-            q_reorder,
-            s_reorder,
-            None,
-            int(k),
-            int(n),
-            int(n_32),
+        # vLLM expects scales in [1, N] layout for repack.
+        q_reorder, s_reorder_1xn = _allspark_repack_weight(
+            b_kn.contiguous(),
+            scales.unsqueeze(0).contiguous(),
         )
 
-        return q_reorder.contiguous(), s_reorder.contiguous()
+        # Store scales as 1D for LinearBase buffers; linear_forward will reshape as needed.
+        s_1d = s_reorder_1xn.reshape(-1).to(dtype=torch.bfloat16)
+        return q_reorder.contiguous(), s_1d.contiguous()
 
     def quantize_act_for_kernel(
         self,
@@ -201,21 +227,23 @@ class LinearMarlinInt8W8A16Strategy(LinearQuantizationStrategy):
         return x, None
 
     def _get_sm_info(self, device: torch.device) -> tuple[int, int]:
+        # get_device_properties is relatively expensive on hot paths; cache per device index.
+        try:
+            idx = int(device.index) if device.index is not None else int(torch.cuda.current_device())
+        except Exception:
+            idx = -1
+        cached = self._sm_info_cache.get(idx)
+        if cached is not None:
+            return cached
         try:
             props = torch.cuda.get_device_properties(device)
             sm_count = int(getattr(props, "multi_processor_count", 0))
             sm_version = int(props.major) * 10 + int(props.minor)
+            self._sm_info_cache[idx] = (sm_count, sm_version)
             return sm_count, sm_version
         except Exception:
+            self._sm_info_cache[idx] = (0, 0)
             return 0, 0
-
-    def _cublas_m_threshold(self) -> int:
-        # For decode, M is typically small, so AllSpark custom kernel is preferred.
-        # For large-M prefill, AllSpark falls back to a dequant+cuBLAS path if M > threshold.
-        try:
-            return int(os.getenv("DIFFULEX_ALLSPARK_CUBLAS_M_THRESHOLD", "256"))
-        except Exception:
-            return 256
 
     def linear_forward(
         self,
@@ -224,28 +252,39 @@ class LinearMarlinInt8W8A16Strategy(LinearQuantizationStrategy):
         bias: Optional[torch.Tensor],
         *,
         quant_kind: str,
-        **kwargs: Any,
+        quant_scales: Optional[torch.Tensor] = None,
+        out_features: Optional[int] = None,
     ) -> torch.Tensor:
         _ = quant_kind
+        if not self._allspark_available or _vllm_ops is None:
+            # correctness fallback only when bf16 weight exists
+            if weight is not None and getattr(weight, "dtype", None) in (torch.float16, torch.bfloat16):
+                return F.linear(x, weight, bias)
+            raise RuntimeError(
+                "vLLM AllSpark W8A16 fused kernel is unavailable. "
+                "Please ensure vLLM custom ops are installed and loadable (`import vllm._custom_ops`)."
+            )
 
-        # Handle >2D like torch.nn.functional.linear: flatten then reshape back.
         orig_shape = x.shape
-        if x.dim() == 1:
-            x2 = x.unsqueeze(0)
-        elif x.dim() == 2:
-            x2 = x
-        else:
-            x2 = x.reshape(-1, x.shape[-1])
+        x2 = x.reshape(-1, x.shape[-1]) if x.dim() != 2 else x
+        if x2.device.type != "cuda":
+            if weight is not None and getattr(weight, "dtype", None) in (torch.float16, torch.bfloat16):
+                return F.linear(x, weight, bias)
+            raise RuntimeError("AllSpark W8A16 requires CUDA inputs.")
+
+        if x2.dtype != torch.bfloat16:
+            x2 = x2.to(dtype=torch.bfloat16)
+        if not x2.is_contiguous():
+            x2 = x2.contiguous()
 
         # Load-time quantized module path: weight is uint8/int8 buffer and scales provided.
-        quant_scales = kwargs.pop("quant_scales", None)
         if weight is not None and weight.dtype in (torch.uint8, torch.int8):
             if quant_scales is None:
                 raise ValueError("quant_scales is required when weight is quantized")
             qweight = weight
             scales = quant_scales
         else:
-            # Lazy cache for bf16 weights (not expected in steady-state, but keep for safety).
+            # Safety net for bf16 weights (should be rare in steady-state).
             weight_id = id(weight)
             cached = self._weight_cache.get(weight_id)
             if cached is None or cached[0].device != x2.device:
@@ -254,103 +293,40 @@ class LinearMarlinInt8W8A16Strategy(LinearQuantizationStrategy):
             else:
                 qweight, scales = cached
 
-        # If fused kernel isn't available, fall back to TileLang or BF16.
-        if _allspark_w8a16_gemm is None or not _allspark_is_available():
-            return self._fallback(x, weight, qweight, scales, bias)
-
-        # AllSpark kernel requires CUDA and contiguous inputs.
-        if x2.device.type != "cuda":
-            return self._fallback(x, weight, qweight, scales, bias)
-
-        if x2.dtype != torch.bfloat16:
-            x2 = x2.to(dtype=torch.bfloat16)
-
-        # Shape checks: x2 [M,K], qweight [N_32align,K]
         m, k = x2.shape
         n_32, k_w = qweight.shape
-        if k_w != k:
-            return self._fallback(x, weight, qweight, scales, bias)
-        if k % 16 != 0:
-            return self._fallback(x, weight, qweight, scales, bias)
+        if k_w != k or (k & 15) != 0:
+            if weight is not None and getattr(weight, "dtype", None) in (torch.float16, torch.bfloat16):
+                y = F.linear(x, weight, bias)
+                return y
+            raise RuntimeError(f"AllSpark W8A16 requires K%16==0 and matching K. Got x.K={k}, w.K={k_w}.")
 
-        # Recover real N from module bias/metadata if available; default to n_32.
-        # In Diffulex, LinearBase stores output_size; but strategy doesn't receive module.
-        # So we infer N from bias if present else from scales length (can be N_32align).
-        n = int(bias.numel()) if bias is not None else int(min(scales.numel(), n_32))
-        if n <= 0 or n > n_32:
-            n = n_32
+        n = int(out_features) if out_features is not None else (int(bias.numel()) if bias is not None else int(min(scales.numel(), n_32)))
+        n = n_32 if (n <= 0 or n > n_32) else n
+        scales_1xn = scales if scales.dim() == 2 else scales.view(1, -1)
 
         sm_count, sm_version = self._get_sm_info(x2.device)
-        cublas_thr = self._cublas_m_threshold()
-
-        y2 = _allspark_w8a16_gemm(
-            x2.contiguous(),
-            qweight.contiguous(),
-            scales.contiguous(),
+        y2 = _vllm_ops.allspark_w8a16_gemm(
+            x2,
+            qweight,
+            scales_1xn,
             None,  # b_qzeros
             n,
             -1,  # group_size (only supports -1)
             sm_count,
             sm_version,
-            cublas_thr,
+            self._cublas_m_thr,
             False,  # has_zp
             True,  # n32k16_reorder
         )
         if bias is not None:
             y2 = y2 + bias
-
-        # Reshape back
+        if orig_shape == x2.shape:
+            return y2
         if x.dim() == 1:
-            y = y2.squeeze(0)
-        elif x.dim() == 2:
-            y = y2
-        else:
-            y = y2.reshape(*orig_shape[:-1], y2.shape[-1])
-        return y
+            return y2.squeeze(0)
+        return y2.reshape(*orig_shape[:-1], y2.shape[-1])
 
-    def _fallback(
-        self,
-        x: torch.Tensor,
-        weight: torch.Tensor,
-        qweight: torch.Tensor,
-        scales: torch.Tensor,
-        bias: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        # Prefer existing TileLang W8A16 if available and inputs are CUDA.
-        if _TILELANG_AVAILABLE and _tilelang_w8a16_gemm is not None and x.device.type == "cuda":
-            try:
-                x2 = x if x.dim() == 2 else x.reshape(-1, x.shape[-1])
-                # TileLang expects int8 weight. If our qweight is uint8 bias128, convert to int8 on the fly.
-                if qweight.dtype == torch.uint8:
-                    q_i8 = (qweight.to(torch.int16) - 128).to(torch.int8)
-                else:
-                    q_i8 = qweight
-                y2 = _tilelang_w8a16_gemm(x2, q_i8, scales, False)
-                if bias is not None:
-                    y2 = y2 + bias
-                if x.dim() == 2:
-                    return y2
-                if x.dim() == 1:
-                    return y2.squeeze(0)
-                return y2.reshape(*x.shape[:-1], y2.shape[-1])
-            except Exception:
-                pass
-
-        # Last resort: BF16 F.linear using dequantized weight if bf16 is available.
-        if weight is not None and getattr(weight, "dtype", None) in (torch.float16, torch.bfloat16):
-            return F.linear(x, weight, bias)
-
-        # Dequantize from qweight + scales and use cuBLAS via F.linear.
-        # qweight may be [N_32,K] or reordered; we cannot reliably undo reorder here.
-        # So only attempt this if qweight looks like plain [N,K] (no padding).
-        if qweight.dim() == 2 and scales.dim() == 1 and qweight.shape[0] == scales.shape[0]:
-            if qweight.dtype == torch.uint8:
-                q = (qweight.to(torch.int16) - 128).to(torch.int8)
-            else:
-                q = qweight
-            s = scales.unsqueeze(-1).to(torch.float32)
-            w_deq = (q.to(torch.float32) * s).to(torch.bfloat16)
-            return F.linear(x, w_deq, bias)
-
-        raise RuntimeError("AllSpark/TileLang unavailable and safe fallback path not found for marlin_int8 W8A16.")
+    # NOTE: We intentionally do not provide a generic dequantize+F.linear fallback for reordered weights.
+    # It materializes a full bf16 matrix and is prone to OOM on large models.
 
