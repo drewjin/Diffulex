@@ -7,6 +7,9 @@ from dataclasses import dataclass
 from easydict import EasyDict as edict
 
 from diffulex.engine.sequence import SequenceBase
+from diffulex.logger import get_logger
+
+logger = get_logger(__name__)
 
 
 class SamplerBase(nn.Module):
@@ -86,14 +89,24 @@ class SamplerShiftLogits(SamplerBase):
         self.seq_last_logits_map: dict[str, torch.Tensor] = {}
         
     def _fetch_last_logits(self, logits: torch.Tensor, seq: SequenceBase) -> torch.Tensor:
+        seq_id_str = str(seq.seq_id)
         if seq.has_to_cache_block:
             last_logits = logits[seq.to_cache_last_token_id]
-            self.seq_last_logits_map[seq.seq_id] = last_logits
-        return self.seq_last_logits_map[seq.seq_id]
+            self.seq_last_logits_map[seq_id_str] = last_logits
+            return last_logits
+        # If no cached block, return cached value if available, otherwise use last logit
+        if seq_id_str in self.seq_last_logits_map:
+            return self.seq_last_logits_map[seq_id_str]
+        # Fallback: use last logit from current batch and cache it
+        last_logits = logits[-1] if logits.shape[0] > 0 else None
+        if last_logits is not None:
+            self.seq_last_logits_map[seq_id_str] = last_logits
+            return last_logits
+        raise ValueError(f"Cannot fetch last logits for sequence {seq.seq_id}: empty logits tensor")
     
     def _shift_logits(self, logits, last_logit=None):
         if logits.shape[1] == 0:
-            print("Warning: logits sequence length is 0, returning empty logits")
+            logger.warning("Logits sequence length is 0, returning empty logits")
             raise Exception("logits sequence length is 0")
             
         shifted_logits = torch.zeros_like(logits)
