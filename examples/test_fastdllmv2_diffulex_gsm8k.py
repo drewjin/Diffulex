@@ -41,6 +41,7 @@ FEW_SHOTS = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
 if __name__ == "__main__":
     PROFILE = False
     model = "/data1/ckpts/Efficient-Large-Model/Fast_dLLM_v2_7B"
+    local_data_path = "/data1/LargeData/gsm8k"
     LLM = Diffulex(
         model,
         use_lora=False,
@@ -50,7 +51,7 @@ if __name__ == "__main__":
         tensor_parallel_size=1,
         gpu_memory_utilization=0.25,
         max_num_batched_tokens=2048,
-        max_num_seqs=20,
+        max_num_seqs=1,
         max_model_len=2048,
         kv_cache_layout="unified",
         decoding_strategy="block_diffusion",

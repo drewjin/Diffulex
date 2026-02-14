@@ -136,6 +136,7 @@ def main() -> None:
     # Build Config + load model weights using Diffulex loader.
     from diffulex.config import Config
     from diffulex.model.auto_model import AutoModelForDiffusionLM
+    import diffulex.model.sdar
 
     cfg = Config(
         model=str(model_dir),

@@ -40,8 +40,7 @@ if __name__ == "__main__":
     tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
     sampling_params = SamplingParams(temperature=0.0, max_tokens=256)
     
-    dataset = load_dataset(
-        "gsm8k", "main", split="test")["question"][:10]
+    dataset = load_dataset("gsm8k", "main")['test']['question'][:]
     prompts = [tokenizer.bos_token + FEW_SHOTS + p for p in tqdm(dataset)]
     
     output_file = "log/profiles/perf_dvllm_dream_7B.json"
