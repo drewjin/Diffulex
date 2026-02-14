@@ -46,6 +46,23 @@ class Config:
     num_kvcache_blocks: int = -1
     k_cache_hdim_split_factor_x: int = 8
     kv_cache_layout: str = "unified"  # "unified" or "distinct"
+    kv_cache_dtype: str = "bf16"  # "bf16", "fp16", "fp32", "fp8_e4m3", "fp8_e5m2"
+    decode_mode: str | None = None  # "static" or "varlen", None means auto-select based on kv_cache_dtype
+    # Attention-Q dtype (activation quantization). "bf16" default; "fp8" is a placeholder
+    # for future kernels (enabling it will currently raise NotImplementedError at runtime).
+    attn_q_dtype: str = "bf16"
+    # Linear quantization (weights + activations). All are placeholders for future kernels.
+    # Use "bf16" to disable quantization.
+    # Supported aliases (normalized in registry): bf16/int8/int4/fp8/fp8_e4m3/fp8_e5m2/gptq/awq.
+    linear_attn_weight_dtype: str = "bf16"
+    linear_mlp_weight_dtype: str = "bf16"
+    linear_attn_act_dtype: str = "bf16"
+    linear_mlp_act_dtype: str = "bf16"
+
+    # Kernel tuning knobs (avoid environment-variable based tuning in library code).
+    # Currently used by some W8A16 linear strategies.
+    linear_w8a16_quant_block_n: int = 256
+    linear_w8a16_allspark_cublas_m_threshold: int = 256
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
@@ -69,9 +86,7 @@ class Config:
         
         if not self.device_ids:
             import torch
-            self.device_ids = (
-                [int(x) for x in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if x.strip()]
-                if os.environ.get("CUDA_VISIBLE_DEVICES", "")
-                else list(range(torch.cuda.device_count()))
-            )
+            # When CUDA_VISIBLE_DEVICES is set, PyTorch maps physical devices to logical device 0, 1, ...
+            # So we should use logical device indices (0, 1, ...) instead of physical device IDs
+            self.device_ids = list(range(torch.cuda.device_count()))
             logger.info(f"Using CUDA devices: {self.device_ids}")

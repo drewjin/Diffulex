@@ -52,6 +52,20 @@ def config_to_model_args(config: BenchmarkConfig) -> str:
         'wait_ready': True,
     }
     
+    # Add quantization parameters if specified
+    if engine.kv_cache_dtype is not None:
+        args_dict['kv_cache_dtype'] = engine.kv_cache_dtype
+    if engine.decode_mode is not None:
+        args_dict['decode_mode'] = engine.decode_mode
+    if engine.linear_attn_weight_dtype is not None:
+        args_dict['linear_attn_weight_dtype'] = engine.linear_attn_weight_dtype
+    if engine.linear_mlp_weight_dtype is not None:
+        args_dict['linear_mlp_weight_dtype'] = engine.linear_mlp_weight_dtype
+    if engine.linear_attn_act_dtype is not None:
+        args_dict['linear_attn_act_dtype'] = engine.linear_attn_act_dtype
+    if engine.linear_mlp_act_dtype is not None:
+        args_dict['linear_mlp_act_dtype'] = engine.linear_mlp_act_dtype
+    
     if engine.tokenizer_path:
         args_dict['tokenizer_path'] = engine.tokenizer_path
     
@@ -192,12 +206,34 @@ def load_config_from_args(args) -> BenchmarkConfig:
         # Override with command line arguments if provided
         if args.model_path:
             config.engine.model_path = args.model_path
+        if getattr(args, "tokenizer_path", None):
+            config.engine.tokenizer_path = args.tokenizer_path
         if args.dataset:
             config.eval.dataset_name = args.dataset
         if args.dataset_limit is not None:
             config.eval.dataset_limit = args.dataset_limit
+        if getattr(args, "max_tokens", None) is not None:
+            config.eval.max_tokens = args.max_tokens
+        if getattr(args, "temperature", None) is not None:
+            config.eval.temperature = args.temperature
         if args.output_dir:
             config.eval.output_dir = args.output_dir
+
+        # Engine overrides (make bench configs reusable for eager vs CUDA Graph comparisons)
+        if getattr(args, "enforce_eager", None) is not None:
+            config.engine.enforce_eager = bool(args.enforce_eager)
+        if getattr(args, "kv_cache_layout", None) is not None:
+            config.engine.kv_cache_layout = args.kv_cache_layout
+        if getattr(args, "decode_mode", None) is not None:
+            config.engine.decode_mode = args.decode_mode
+        if getattr(args, "kv_cache_dtype", None) is not None:
+            config.engine.kv_cache_dtype = args.kv_cache_dtype
+        if getattr(args, "max_model_len", None) is not None:
+            config.engine.max_model_len = args.max_model_len
+        if getattr(args, "max_num_seqs", None) is not None:
+            config.engine.max_num_seqs = args.max_num_seqs
+        if getattr(args, "max_num_batched_tokens", None) is not None:
+            config.engine.max_num_batched_tokens = args.max_num_batched_tokens
     else:
         if not args.model_path:
             logger.error("Either --config or --model-path must be provided")
@@ -218,12 +254,19 @@ def load_config_from_args(args) -> BenchmarkConfig:
             max_num_seqs=getattr(args, 'max_num_seqs', 128),
             use_lora=args.use_lora,
             lora_path=args.lora_path,
-            enforce_eager=getattr(args, 'enforce_eager', False),
             kv_cache_layout=getattr(args, 'kv_cache_layout', 'unified'),
             accept_threshold=args.accept_threshold,
             complete_threshold=args.complete_threshold,
             add_new_block_threshold=args.add_new_block_threshold,
             diffusion_block_size=args.diffusion_block_size,
+            kv_cache_dtype=getattr(args, 'kv_cache_dtype', None),
+            decode_mode=getattr(args, 'decode_mode', None),
+            # Force enforce_eager=True for varlen mode to avoid CUDA graph capture error
+            enforce_eager=True if getattr(args, 'decode_mode', None) == 'varlen' else (args.enforce_eager if hasattr(args, 'enforce_eager') else False),
+            linear_attn_weight_dtype=getattr(args, 'linear_attn_weight_dtype', None),
+            linear_mlp_weight_dtype=getattr(args, 'linear_mlp_weight_dtype', None),
+            linear_attn_act_dtype=getattr(args, 'linear_attn_act_dtype', None),
+            linear_mlp_act_dtype=getattr(args, 'linear_mlp_act_dtype', None),
         )
         
         eval_config = EvalConfig(

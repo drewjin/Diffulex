@@ -37,6 +37,7 @@ autotuner.log
 Fast-dLLM
 Discrete-Diffusion-Forcing
 position_explanation.md
+temp/
 cuda_cache/
 
 # IDE
@@ -53,3 +54,8 @@ GITHUB_ISSUE.md
 Tilelang-failed_test_cases/
 sglang/
 sglang
+# Benchmark results
+benchmark_results/
+benchmark_results_tmp/
+# Cursor IDE files
+.cursor/

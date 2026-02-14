@@ -211,6 +211,13 @@ Examples:
         help="Enforce eager mode (disable CUDA graphs)",
     )
     parser.add_argument(
+        "--no-enforce-eager",
+        dest="enforce_eager",
+        action="store_false",
+        help="Disable eager mode (enable CUDA graphs when supported)",
+    )
+    parser.set_defaults(enforce_eager=None)
+    parser.add_argument(
         "--kv-cache-layout",
         type=str,
         default="unified",
@@ -242,6 +249,46 @@ Examples:
         type=int,
         default=32,
         help="Diffusion block size",
+    )
+    
+    # Quantization arguments
+    parser.add_argument(
+        "--kv-cache-dtype",
+        type=str,
+        default=None,
+        choices=["bf16", "fp16", "fp32", "fp8_e4m3", "fp8_e5m2"],
+        help="KV cache data type",
+    )
+    parser.add_argument(
+        "--decode-mode",
+        type=str,
+        default=None,
+        choices=["static", "varlen"],
+        help="Decode mode (static or varlen)",
+    )
+    parser.add_argument(
+        "--linear-attn-weight-dtype",
+        type=str,
+        default=None,
+        help="Linear attention weight dtype",
+    )
+    parser.add_argument(
+        "--linear-mlp-weight-dtype",
+        type=str,
+        default=None,
+        help="Linear MLP weight dtype",
+    )
+    parser.add_argument(
+        "--linear-attn-act-dtype",
+        type=str,
+        default=None,
+        help="Linear attention activation dtype",
+    )
+    parser.add_argument(
+        "--linear-mlp-act-dtype",
+        type=str,
+        default=None,
+        help="Linear MLP activation dtype",
     )
     
     return parser

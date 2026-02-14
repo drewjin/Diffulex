@@ -10,7 +10,7 @@ engine:
   tensor_parallel_size: 1
   data_parallel_size: 1
   gpu_memory_utilization: 0.9
-  max_model_len: 2048
+  max_model_len: 4096
   
   use_lora: false
   enforce_eager: false

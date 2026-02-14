@@ -38,7 +38,7 @@ def summarize_profiling(csv_path: str) -> dict:
 if __name__ == "__main__":
     WEIGHT_DIR = "/data1/ckpts"
     DATA_DIR = "/data1/LargeData"
-    model = f"{WEIGHT_DIR}/GSAI-ML/llada-8b-instruct"
+    model = f"{WEIGHT_DIR}/GSAI-ML/LLaDA-8B-Instruct"
     LLM = LLM(
         model, 
         lora_path=f"{WEIGHT_DIR}/SJTU-Deng-Lab/D2F_LLaDA_Instruct_8B_Lora",
@@ -83,4 +83,5 @@ if __name__ == "__main__":
           "=*=" * 30)
     for idx, o in enumerate(outputs):
         print("\n", "=*=" * 30)
-        print(f"[Prompt {idx} Result] \n{prompts[idx] + "\n-----<Start-of-Response>-----\n" + o['text']}\n")
+        resp = prompts[idx] + "\n-----<Start-of-Response>-----\n" + o["text"]
+        print(f"[Prompt {idx} Result]\n{resp}\n")

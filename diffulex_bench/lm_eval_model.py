@@ -57,6 +57,12 @@ class DiffulexLM(LM):
         diffusion_block_size: Optional[int] = 32,
         save_dir: Optional[str] = None,
         wait_ready: Optional[bool] = True,
+        kv_cache_dtype: Optional[str] = None,
+        decode_mode: Optional[str] = None,
+        linear_attn_weight_dtype: Optional[str] = None,
+        linear_mlp_weight_dtype: Optional[str] = None,
+        linear_attn_act_dtype: Optional[str] = None,
+        linear_mlp_act_dtype: Optional[str] = None,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -114,6 +120,12 @@ class DiffulexLM(LM):
             complete_threshold=complete_threshold,
             add_new_block_threshold=add_new_block_threshold,
             diffusion_block_size=diffusion_block_size,
+            kv_cache_dtype=kv_cache_dtype,
+            decode_mode=decode_mode,
+            linear_attn_weight_dtype=linear_attn_weight_dtype,
+            linear_mlp_weight_dtype=linear_mlp_weight_dtype,
+            linear_attn_act_dtype=linear_attn_act_dtype,
+            linear_mlp_act_dtype=linear_mlp_act_dtype,
         )
         
         self.tokenizer = self.runner.tokenizer

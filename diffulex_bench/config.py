@@ -44,6 +44,14 @@ class EngineConfig:
     add_new_block_threshold: float = 0.1
     diffusion_block_size: int = 32
     
+    # Quantization configuration
+    kv_cache_dtype: Optional[str] = None  # "bf16", "fp16", "fp32", "fp8_e4m3", "fp8_e5m2"
+    decode_mode: Optional[str] = None  # "static" or "varlen"
+    linear_attn_weight_dtype: Optional[str] = None  # "bf16", "int8", "int4", "fp8_e4m3", etc.
+    linear_mlp_weight_dtype: Optional[str] = None
+    linear_attn_act_dtype: Optional[str] = None
+    linear_mlp_act_dtype: Optional[str] = None
+    
     @classmethod
     def from_dict(cls, config_dict: Dict[str, Any]) -> "EngineConfig":
         """Create engine configuration from dictionary"""
@@ -77,6 +85,22 @@ class EngineConfig:
             'add_new_block_threshold': self.add_new_block_threshold,
             'diffusion_block_size': self.diffusion_block_size,
         }
+        
+        # Add quantization parameters if specified
+        if self.kv_cache_dtype is not None:
+            kwargs['kv_cache_dtype'] = self.kv_cache_dtype
+        if self.decode_mode is not None:
+            kwargs['decode_mode'] = self.decode_mode
+        if self.linear_attn_weight_dtype is not None:
+            kwargs['linear_attn_weight_dtype'] = self.linear_attn_weight_dtype
+        if self.linear_mlp_weight_dtype is not None:
+            kwargs['linear_mlp_weight_dtype'] = self.linear_mlp_weight_dtype
+        if self.linear_attn_act_dtype is not None:
+            kwargs['linear_attn_act_dtype'] = self.linear_attn_act_dtype
+        if self.linear_mlp_act_dtype is not None:
+            kwargs['linear_mlp_act_dtype'] = self.linear_mlp_act_dtype
+        
+        return kwargs
 
 
 @dataclass
@@ -149,7 +173,9 @@ class BenchmarkConfig:
                 'data_parallel_size', 'gpu_memory_utilization', 'max_model_len',
                 'max_num_batched_tokens', 'max_num_seqs', 'enforce_eager',
                 'kv_cache_layout', 'accept_threshold', 'complete_threshold',
-                'add_new_block_threshold', 'diffusion_block_size'
+                'add_new_block_threshold', 'diffusion_block_size',
+                'kv_cache_dtype', 'decode_mode', 'linear_attn_weight_dtype',
+                'linear_mlp_weight_dtype', 'linear_attn_act_dtype', 'linear_mlp_act_dtype'
             }
             
             engine_dict = {k: v for k, v in config_dict.items() if k in engine_fields}
