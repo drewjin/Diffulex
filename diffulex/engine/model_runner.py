@@ -44,12 +44,11 @@ class ModelRunnerBase(ABC):
         self.model = self.load_model(config)
         self.sampler = self.load_sampler(config)
         self.warmup_model()
-        self.allocate_kv_cache()  # NOCHANGE
+        self.allocate_kv_cache()
         if not self.enforce_eager:
             self.capture_cudagraph()
 
         # Allocate shared memory for inter-process communication
-        # NOCHANGE
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
         if self.world_size > 1:

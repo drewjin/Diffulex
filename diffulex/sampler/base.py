@@ -92,7 +92,10 @@ class SamplerShiftLogits(SamplerBase):
         if seq.has_to_cache_block:
             last_logits = logits[seq.to_cache_last_token_id]
             self.seq_last_logits_map[seq.seq_id] = last_logits
-        return self.seq_last_logits_map[seq.seq_id]
+        # NOTE: might have bug here
+        return (self.seq_last_logits_map[seq.seq_id] 
+                if seq.seq_id in self.seq_last_logits_map 
+                else logits[-1]) 
     
     def _shift_logits(self, logits, last_logit=None):
         if logits.shape[1] == 0:

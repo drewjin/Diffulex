@@ -21,7 +21,7 @@ engine:
 
 eval:
   dataset_name: "gsm8k"
-  dataset_limit: 100
+  dataset_limit: null
   
   temperature: 0.0
   max_tokens: 256

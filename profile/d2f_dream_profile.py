@@ -2,11 +2,13 @@
 D2F Dream Model Profiling Example
 
 This example demonstrates how to profile the performance
-of Dream model with D2F decoding strategy using nsys.
+of Dream model with D2F decoding strategy using PyTorch Profiler.
 """
 import os
 import time
 from pathlib import Path
+import torch
+from torch.profiler import profile, record_function, ProfilerActivity
 from diffulex import Diffulex, SamplingParams
 from transformers import AutoTokenizer
 
@@ -49,17 +51,35 @@ def main():
         "Write a Python function to calculate factorial.",
     ]
     
-    print(f"\nStarting inference profiling...")
+    print(f"\nStarting inference profiling with PyTorch Profiler...")
     
-    inference_start = time.time()
-    outputs = llm.generate(prompts, sampling_params)
-    inference_time = time.time() - inference_start
+    # PyTorch Profiler
+    trace_file = output_dir / "d2f_dream_trace.json"
+    with_stack = os.getenv("DIFFULEX_PROFILE_WITH_STACK", "True").lower() == "true"
     
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=with_stack,
+    ) as prof:
+        with record_function("d2f_inference"):
+            inference_start = time.time()
+            outputs = llm.generate(prompts, sampling_params)
+            inference_time = time.time() - inference_start
+    
+    # Export trace file
+    prof.export_chrome_trace(str(trace_file))
+    print(f"PyTorch Profiler trace saved to: {trace_file}")
+    print(f"View trace at: https://ui.perfetto.dev/")
+    
+    # Calculate metrics
     total_tokens = sum(len(o.get('token_ids', [])) for o in outputs)
     num_outputs = len(outputs)
     avg_diff_steps = sum(o.get('n_diff_steps', 0) for o in outputs) / num_outputs if outputs else 0
     throughput = total_tokens / inference_time if inference_time > 0 else 0
     
+    # Print summary
     print("\n" + "=" * 80)
     print("Profiling Summary")
     print("=" * 80)
