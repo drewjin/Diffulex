@@ -10,6 +10,68 @@ from diffulex_kernel.python.chunked_prefill_triton import (
 
 
 # ---------------------------------------------------------------------------
+# Mask visualization helper
+# ---------------------------------------------------------------------------
+
+
+def _visualize_mask(mask, seq_id, ctx_len, valid_q_len, block_size, label):
+    """Visualize attention mask with clear structure."""
+    print(f"\n{'='*80}")
+    print(f"Seq {seq_id} | {label} | ctx_len={ctx_len}, valid_q_len={valid_q_len}, block_size={block_size}")
+    print(f"{'='*80}")
+
+    mask_np = mask.cpu().numpy()
+    total_kv = mask_np.shape[1]
+
+    # Print header
+    print(f"Mask shape: Q={mask_np.shape[0]} x KV={total_kv} (cache={ctx_len}, new={valid_q_len})")
+
+    # Compact visualization for large masks
+    if valid_q_len > 64 or total_kv > 64:
+        print("\n[Compact view - showing block boundaries]")
+        step = max(1, block_size // 4)
+        sample_q = list(range(0, valid_q_len, step))
+        sample_kv = list(range(0, total_kv, step))
+
+        print(f"\n    KV→", end="")
+        for kv_idx in sample_kv:
+            if kv_idx < ctx_len:
+                print(f" C{kv_idx:3d}", end="")
+            else:
+                print(f" N{kv_idx-ctx_len:3d}", end="")
+        print()
+
+        for q_idx in sample_q:
+            block_id = q_idx // block_size
+            print(f"Q{q_idx:3d}(B{block_id})", end="")
+            for kv_idx in sample_kv:
+                print(f"  {'█' if mask_np[q_idx, kv_idx] else '·'}  ", end="")
+            print()
+    else:
+        # Full visualization for small masks
+        print(f"\n    KV→", end="")
+        for kv_idx in range(total_kv):
+            if kv_idx < ctx_len:
+                print(f"C{kv_idx%10}", end="")
+            else:
+                print(f"N{(kv_idx-ctx_len)%10}", end="")
+        print()
+
+        for q_idx in range(valid_q_len):
+            block_id = q_idx // block_size
+            print(f"Q{q_idx:2d}(B{block_id})", end="")
+            for kv_idx in range(total_kv):
+                print("█" if mask_np[q_idx, kv_idx] else "·", end="")
+            print()
+
+    # Statistics
+    visible_per_q = mask_np.sum(axis=1)
+    print(f"\nStats: min_visible={visible_per_q.min():.0f}, max_visible={visible_per_q.max():.0f}, "
+          f"avg_visible={visible_per_q.mean():.1f}")
+    print(f"{'='*80}\n")
+
+
+# ---------------------------------------------------------------------------
 # Kernel invocation (direct call, bypasses the incomplete Python wrapper)
 # ---------------------------------------------------------------------------
 
@@ -31,7 +93,7 @@ def call_chunked_prefill_kernel(
     dllm_block_size,
     is_block_causal,
     is_prefix_full=False,
-    BLOCK_M=128,
+    BLOCK_M=64,
     BLOCK_N=64,
 ):
     o = torch.zeros_like(q)
@@ -118,6 +180,7 @@ def naive_chunked_prefill_ref(
     dllm_block_size,
     is_block_causal,
     is_prefix_full=False,
+    visualize_mask=False,
 ):
     """
     Per-request reference:
@@ -187,6 +250,10 @@ def naive_chunked_prefill_ref(
             )
             mask = torch.cat([cache_mask, new_kv_mask], dim=1)
             mask = mask.unsqueeze(0).unsqueeze(0)
+
+            if visualize_mask:
+                _visualize_mask(mask[0, 0], seq_id, ctx_len, valid_q_len, dllm_block_size,
+                               f"prefix_full_status{status}_P{P}_Pp{P_prime}")
         elif is_block_causal:
             qi = torch.arange(valid_q_len, device=q.device)
             kj = torch.arange(valid_q_len, device=q.device)
@@ -200,6 +267,9 @@ def naive_chunked_prefill_ref(
             )
             mask = torch.cat([cache_mask, new_kv_mask], dim=1)
             mask = mask.unsqueeze(0).unsqueeze(0)
+
+            if visualize_mask:
+                _visualize_mask(mask[0, 0], seq_id, ctx_len, valid_q_len, dllm_block_size, "block_causal")
 
         q_sdpa = rearrange(q_seq, "s h d -> 1 h s d")
         k_sdpa = rearrange(k_full, "s h d -> 1 h s d")
@@ -330,6 +400,7 @@ def _run_test(
     seed=42,
     atol=1e-2,
     rtol=1e-2,
+    visualize_mask=False,
 ):
     torch.manual_seed(seed)
     num_seqs = len(q_lens)
@@ -390,17 +461,18 @@ def _run_test(
         dllm_block_size,
         is_block_causal=is_block_causal,
         is_prefix_full=is_prefix_full,
+        visualize_mask=visualize_mask,
     )
 
-    for i, vql in enumerate(valid_q_lens):
+    for i in range(num_seqs):
         q_start = int(cu[i].item())
-        if vql > 0:
-            torch.testing.assert_close(
-                out[q_start : q_start + vql],
-                ref[q_start : q_start + vql],
-                atol=atol,
-                rtol=rtol,
-            )
+        q_end = int(cu[i + 1].item())
+        torch.testing.assert_close(
+            out[q_start:q_end],
+            ref[q_start:q_end],
+            atol=atol,
+            rtol=rtol,
+        )
 
 
 # ========================= Case 1: Pure Prefill ==========================
@@ -853,6 +925,23 @@ def test_prefix_full_extended_strategies(
         is_prefix_full=True,
         statuses=statuses,
         prefix_lens=prefix_lens,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_visualize_mask_example():
+    """Example: visualize mask for debugging."""
+    _run_test(
+        q_lens=[128, 96],
+        valid_q_lens=[64, 32],
+        ctx_lens=[64, 128],
+        num_heads=32,
+        num_kv_heads=8,
+        head_dim=128,
+        page_size=32,
+        dllm_block_size=32,
+        is_block_causal=True,
+        visualize_mask=True,
     )
 
 

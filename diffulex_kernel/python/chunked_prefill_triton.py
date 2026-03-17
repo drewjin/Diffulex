@@ -6,6 +6,7 @@ from diffulex.attention.metadata import AttnMetaDataBase
 from diffulex_kernel.python.auto_tuner import build_chunked_prefill_configs
 
 
+# NOTE: While doing test, comment auto-tuner to avoid slowing down the test.
 @triton.autotune(
     configs=[
         triton.Config(c, num_warps=c.pop("num_warps"), num_stages=c.pop("num_stages"))
