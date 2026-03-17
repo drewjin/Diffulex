@@ -90,7 +90,7 @@ class DllmReqMultiBlockMixin:
         last_in_cache_block = self.dllm_block_buffer.first_running_block.prev_block
         return eos_detect_fn(seq) or (
             last_in_cache_block.is_last_in_context and eos_detect_fn(last_in_cache_block.token_ids)
-        )
+        ) or eos_detect_fn(self.token_ids)
 
     @property
     def num_prefix_blocks(self) -> int:
@@ -335,6 +335,7 @@ class DllmReqMultiBlockMixin:
 
     def step(self):
         self.lazy_activate()
+        
         # Condition to activate the next block, when buffer contains active blocks
         activate_cond = self.dllm_block_buffer.should_add_block and not self.dllm_block_buffer.is_overflow
 
