@@ -189,18 +189,18 @@ class ModelRunnerMultiBlockMixin:
             if key != "outputs":
                 value.zero_()
 
-        num_seqs = len(attn_metadata.context_lens)
+        num_reqs = attn_metadata.num_reqs
         graph_vars["input_ids"][:num_tokens] = input_ids
         graph_vars["positions"][:num_tokens] = positions
         graph_vars["slot_mapping"][:num_tokens] = attn_metadata.slot_mapping
-        graph_vars["context_lens"][:num_seqs] = attn_metadata.context_lens
-        graph_vars["cu_seqlens_q"][: num_seqs + 1] = attn_metadata.cu_seqlens_q
-        graph_vars["cu_seqlens_k"][: num_seqs + 1] = attn_metadata.cu_seqlens_k
-        graph_vars["valid_slices"][:num_seqs] = attn_metadata.valid_slices
-        graph_vars["status_table"][:num_seqs] = attn_metadata.status_table
-        graph_vars["prefix_lens"][:num_seqs] = attn_metadata.prefix_lens
-        graph_vars["padded_prefix_lens"][:num_seqs] = attn_metadata.padded_prefix_lens
-        graph_vars["page_tables"][:num_seqs, : attn_metadata.page_tables.size(1)] = attn_metadata.page_tables
+        graph_vars["context_lens"][:num_reqs] = attn_metadata.context_lens
+        graph_vars["cu_seqlens_q"][: num_reqs + 1] = attn_metadata.cu_seqlens_q
+        graph_vars["cu_seqlens_k"][: num_reqs + 1] = attn_metadata.cu_seqlens_k
+        graph_vars["valid_slices"][:num_reqs] = attn_metadata.valid_slices
+        graph_vars["status_table"][:num_reqs] = attn_metadata.status_table
+        graph_vars["prefix_lens"][:num_reqs] = attn_metadata.prefix_lens
+        graph_vars["padded_prefix_lens"][:num_reqs] = attn_metadata.padded_prefix_lens
+        graph_vars["page_tables"][:num_reqs, : attn_metadata.page_tables.size(1)] = attn_metadata.page_tables
 
         # Update attn_metadata to use graph_vars tensors
         attn_metadata.slot_mapping = graph_vars["slot_mapping"]
