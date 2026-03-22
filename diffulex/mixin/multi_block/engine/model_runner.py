@@ -19,31 +19,23 @@ if TYPE_CHECKING:
 
 class ModelRunnerMultiBlockMixin:
     def _prepare_prefill_req(self: ModelRunnerBase, req: DllmReq):
-        running_sequence = req.running_sequence
-        total_seqlen = len(running_sequence)
+        input_ids = req.running_sequence
+        total_seqlen = len(input_ids)
         in_cache_len = req.in_cache_len
 
-        input_ids = list(running_sequence)
         positions = list(range(in_cache_len, total_seqlen))
         context_len = 0
 
         seqlen_q = total_seqlen - in_cache_len
         seqlen_k = total_seqlen
 
-        slot_mapping: list[int] = []
-        if req.page_table:
-            has_padding_mask = req.padded_prefix_len > 0
-            for rel_page_id in range(0, req.num_pages_with_seq_len(len(running_sequence))):
-                if req.page_cache_missed[rel_page_id]:
-                    if has_padding_mask and rel_page_id >= req.num_prefix_pages - 1:
-                        slot_mapping.extend([-1] * self.page_size)
-                    else:
-                        # NOTE: only support block_size % page_size == 0
-                        start = req.page_table[rel_page_id] * self.page_size
-                        end = start + self.page_size
-                        slot_mapping.extend(range(start, end))
-                else:
-                    slot_mapping.extend([-1] * self.page_size)
+        slot_mapping= []
+        for abs_page_id in req.page_table:
+            start = abs_page_id * self.page_size
+            end = start + self.page_size
+            slot_mapping.extend(range(start, end))
+        remain_num_tokens = len(input_ids) - len(slot_mapping)
+        slot_mapping.extend([-1] * remain_num_tokens)
 
         return dict(
             input_ids=input_ids,
@@ -67,18 +59,14 @@ class ModelRunnerMultiBlockMixin:
         seqlen_k = req.chunk_size
         valid_slice = req.valid_len
 
-        slot_mapping: list[int] = []
-        num_pages_per_block = req.block_size // self.page_size
-        for block in req.dllm_block_buffer.dllm_blocks:
-            if block.is_to_cache:
-                cur_prefix_num_pages = (block.start + self.page_size - 1) // self.page_size
-                for in_blk_page_id in range(num_pages_per_block):
-                    rel_page_id = cur_prefix_num_pages + in_blk_page_id
-                    start = req.page_table[rel_page_id] * self.page_size
-                    end = start + self.page_size
-                    slot_mapping.extend(range(start, end))
-            else:
-                slot_mapping.extend([-1] * block.block_size)
+        slot_mapping = []
+        for rel_page_id, abs_page_id in enumerate(req.page_table):
+            if rel_page_id >= req.num_pages_with_seq_len(req.in_cache_len):
+                start = abs_page_id * self.page_size
+                end = start + self.page_size
+                slot_mapping.extend(range(start, end))
+        remain_num_tokens = len(input_ids) - len(slot_mapping)
+        slot_mapping.extend([-1] * remain_num_tokens)
 
         return dict(
             input_ids=input_ids,

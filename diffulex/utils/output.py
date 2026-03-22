@@ -6,6 +6,22 @@ from diffulex.logger import get_logger
 logger = get_logger(__name__)
 
 
+def decode_token_ids_robust(tokenizer, token_ids: list[int] | None, *, skip_special_tokens: bool = False) -> str:
+    """Decode token ids to text.
+
+    Some checkpoints emit ids that ``convert_ids_to_tokens`` maps to ``None`` (tokenizer/model vocab skew).
+    Qwen2/GPT2 ``convert_tokens_to_string`` then does ``"".join(tokens)`` and crashes with ``TypeError``.
+    """
+    if not token_ids:
+        return ""
+    try:
+        return tokenizer.decode(token_ids, skip_special_tokens=skip_special_tokens)
+    except TypeError:
+        tokens = tokenizer.convert_ids_to_tokens(token_ids)
+        safe = [t if t is not None else "" for t in tokens]
+        return tokenizer.convert_tokens_to_string(safe)
+
+
 @dataclass
 class ReqStep:
     step_id: int
@@ -179,8 +195,10 @@ class GenerationOutputs:
         logger.info("--------------------------------")
 
     def convert_to_text(self, tokenizer):
+        eos = getattr(tokenizer, "eos_token", None) or ""
         for trajectory in self.trajectories:
-            trajectory.text = tokenizer.decode(trajectory.token_ids).split(tokenizer.eos_token)[0]
+            raw = decode_token_ids_robust(tokenizer, trajectory.token_ids)
+            trajectory.text = raw.split(eos)[0] if eos else raw
 
     def to_benchmark_format(self) -> list[dict]:
         """Convert to list of dicts expected by diffulex_bench: text, token_ids, n_diff_steps."""
