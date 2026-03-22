@@ -63,7 +63,7 @@ class SamplerBase(nn.Module):
             try:
                 x0 = dists.Categorical(probs=probs).sample()
                 initial_confidence = torch.gather(probs, -1, x0.unsqueeze(-1)).squeeze(-1)
-            except:
+            except Exception:
                 initial_confidence, x0 = probs.max(dim=-1)
         else:
             initial_confidence, x0 = probs.max(dim=-1)

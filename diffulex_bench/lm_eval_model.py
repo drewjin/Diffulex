@@ -13,6 +13,7 @@ from lm_eval.api.model import LM
 from lm_eval.api.registry import register_model
 
 from diffulex import SamplingParams
+from diffulex.utils.output import decode_token_ids_robust
 from diffulex_bench.runner import BenchmarkRunner
 from diffulex.logger import get_logger
 
@@ -150,8 +151,13 @@ class DiffulexLM(LM):
     def tok_decode(self, tokens, skip_special_tokens=True):
         """Decode tokens to text"""
         if isinstance(tokens, list) and len(tokens) > 0 and isinstance(tokens[0], list):
-            return [self.tokenizer.decode(t, skip_special_tokens=skip_special_tokens) for t in tokens]
-        return self.tokenizer.decode(tokens, skip_special_tokens=skip_special_tokens)
+            return [
+                decode_token_ids_robust(self.tokenizer, t, skip_special_tokens=skip_special_tokens)
+                for t in tokens
+            ]
+        return decode_token_ids_robust(
+            self.tokenizer, tokens, skip_special_tokens=skip_special_tokens
+        )
 
     def tok_encode(self, text, add_special_tokens=True):
         """Encode text to tokens"""

@@ -212,8 +212,9 @@ class DllmReqMultiBlockMixin:
 
     @property
     def to_cache_len(self) -> int:
-        if self.is_prefilling:
-            return self.padded_prefix_len - self.block_size if self.is_padded else self.padded_prefix_len
+        if self.is_prefilling or self.is_pending or self.is_waiting:
+            # return self.padded_prefix_len - self.block_size if self.is_padded else self.prefix_len
+            return sum(b.is_to_cache for b in self.dllm_blocks) * self.block_size
         elif self.is_decoding or self.is_preempted:
             return len(self.dllm_block_buffer.to_cache_blocks) * self.block_size
 
@@ -399,6 +400,7 @@ class DllmReqMultiBlockMixin:
         if self.eos_token_generated:
             self.dllm_block_buffer.last_valid_block.make_last_in_context()
             self.meet_eos = True
+            self.dllm_block_buffer.maybe_fix_context_management()
 
         if (
             self.eos_token_generated or self.max_new_tokens_reached or self.max_model_len_reached

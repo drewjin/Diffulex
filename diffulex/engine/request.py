@@ -56,7 +56,8 @@ class DllmReq(DllmReqMultiBlockMixin):
     @property
     def num_pages(self) -> int:
         if self.is_multi_block:
-            return (self.running_len + self.page_size - 1) // self.page_size
+            # return (self.running_len + self.page_size - 1) // self.page_size
+            return (self.to_cache_len + self.page_size - 1) // self.page_size
         else:
             return (self.num_tokens + self.page_size - 1) // self.page_size
 

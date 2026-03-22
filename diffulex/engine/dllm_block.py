@@ -267,3 +267,7 @@ class DllmBlockBuffer:
 
     def activate_cursor_slot_block(self):
         self.slot_block.status = DllmBlockStatus.ACTIVE
+        
+    def maybe_fix_context_management(self):
+        if self.first_valid_block.is_dummy and self.first_valid_block.is_last_in_context:
+            self.first_valid_block.prev_block.make_last_in_context()

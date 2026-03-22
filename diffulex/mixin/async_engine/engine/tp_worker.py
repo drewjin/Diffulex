@@ -5,6 +5,7 @@ from time import perf_counter
 from concurrent.futures import ThreadPoolExecutor
 
 from diffulex.sampling_params import SamplingParams
+from diffulex.utils.output import decode_token_ids_robust
 
 
 class DiffulexTPWorkerAsyncMixin:
@@ -96,16 +97,21 @@ class DiffulexTPWorkerAsyncMixin:
             f"Finished in {n_steps} steps, prefill throughput: {prefill_throughput:.2f} tok/s, decode throughput: {decode_throughput:.2f} tok/s"
         )
         assert all(toks is not None for toks in outputs), "Some reqs did not produce outputs"
-        outputs = [
-            {
-                "text": self.tokenizer.decode(token_ids).split(self.tokenizer.eos_token)[0],
-                "token_ids": token_ids[: token_ids.index(self.config.eos)]
-                if self.config.eos in token_ids
-                else token_ids,
-                "n_diff_steps": n_diff_step,
-            }
-            for token_ids, n_diff_step in zip(outputs, n_diff_steps)
-        ]
+        eos = getattr(self.tokenizer, "eos_token", None) or ""
+        formatted = []
+        for token_ids, n_diff_step in zip(outputs, n_diff_steps):
+            raw = decode_token_ids_robust(self.tokenizer, token_ids)
+            text = raw.split(eos)[0] if eos else raw
+            formatted.append(
+                {
+                    "text": text,
+                    "token_ids": token_ids[: token_ids.index(self.config.eos)]
+                    if self.config.eos in token_ids
+                    else token_ids,
+                    "n_diff_steps": n_diff_step,
+                }
+            )
+        outputs = formatted
         if use_tqdm:
             pbar.close()
         return outputs
